@@ -1,0 +1,7 @@
+# 构建产物与本地调试缓存
+DeepBrim.zip
+*.zip
+download.devtools
+
+# 本地笔记
+链接.txt
