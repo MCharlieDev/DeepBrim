@@ -1017,7 +1017,7 @@ function requestHardRefresh() {
       sessionId: state.sessionId,
       hasCache: (state.officialTotal ?? state.baselineValue) != null
     },
-    '*'
+    location.origin
   )
 }
 
@@ -1046,21 +1046,29 @@ function spinOnce() {
 function showToast(text, options = {}) {
   const { loading = false, timeout = 1500 } = options
   const rect = disc.getBoundingClientRect()
-  let top = rect.top - 28
 
+  // 先写入文案，才能量到真实宽高用于边界夹取
+  toastEl.querySelector('.db-toast-text').textContent = text
+  const width = toastEl.offsetWidth || 120
+  const height = toastEl.offsetHeight || 28
+
+  let top = rect.top - height - 8
   if (top < 8) {
     // 上方放不下：面板开着就落到面板下方，否则落到圆盘下方
     if (panel.classList.contains('db-open')) {
       const panelRect = panel.getBoundingClientRect()
-      top = Math.min(window.innerHeight - 30, panelRect.bottom + 6)
+      top = panelRect.bottom + 6
     } else {
       top = rect.bottom + 8
     }
   }
+  top = Math.max(8, Math.min(window.innerHeight - height - 8, top))
 
-  toastEl.querySelector('.db-toast-text').textContent = text
+  let left = rect.left + rect.width / 2
+  left = Math.max(8 + width / 2, Math.min(window.innerWidth - 8 - width / 2, left))
+
   toastEl.classList.toggle('db-loading', loading)
-  toastEl.style.left = `${rect.left + rect.width / 2}px`
+  toastEl.style.left = `${left}px`
   toastEl.style.top = `${top}px`
   toastEl.classList.add('db-show')
 
@@ -1085,7 +1093,7 @@ function handleData(msg) {
   if (type === 'history-baseline') {
     // 拉取失败时不覆盖现有数据显示，只给提示
     if (payload.ok === false) {
-      if (pendingHardRefresh && payload.source !== 'page') {
+      if (pendingHardRefresh && payload.source !== 'page' && !payload.auto) {
         pendingHardRefresh = false
         clearTimeout(pendingTimer)
         stopSpin()
@@ -1110,7 +1118,7 @@ function handleData(msg) {
     state.fromCache = false
     saveCache()
 
-    if (pendingHardRefresh && payload.source !== 'page') {
+    if (pendingHardRefresh && payload.source !== 'page' && !payload.auto) {
       pendingHardRefresh = false
       clearTimeout(pendingTimer)
       stopSpin()
@@ -1132,6 +1140,11 @@ function handleData(msg) {
 
   if (type === 'usage') {
     if (payload.total != null && payload.total > 0) {
+      // 新一轮的第一帧：清掉上一轮的本轮值，避免显示残留数字
+      if (state.officialTotal != null && payload.total > state.officialTotal) {
+        state.roundTokens = null
+        state.roundSource = null
+      }
       state.officialTotal = payload.total
       state.updatedAt = Date.now()
       state.fromCache = false
@@ -1141,7 +1154,9 @@ function handleData(msg) {
 
   if (type === 'stream-end') {
     if (payload.total != null && payload.total > 0) state.officialTotal = payload.total
-    state.attachmentTokens = payload.attachmentTokens ?? state.attachmentTokens
+    if (payload.attachmentTokens != null) {
+      state.attachmentTokens = Math.max(state.attachmentTokens || 0, payload.attachmentTokens)
+    }
     state.updatedAt = Date.now()
     state.fromCache = false
     saveCache()
@@ -1160,7 +1175,9 @@ function handleData(msg) {
   }
 
   if (type === 'file-usage') {
-    state.attachmentTokens = (state.attachmentTokens || 0) + (payload.tokens || 0)
+    // 只认 inject 汇总后的会话累计值，且不因页面刷新后 files 归零而回退
+    const total = payload.total != null ? payload.total : (state.attachmentTokens || 0) + (payload.tokens || 0)
+    state.attachmentTokens = Math.max(state.attachmentTokens || 0, total)
     state.updatedAt = Date.now()
     saveCache()
   }
@@ -1237,6 +1254,7 @@ function writeCache() {
   if (state.officialTotal == null && state.baselineValue == null) return
 
   const key = CACHE_PREFIX + state.sessionId
+  const updatedAt = state.updatedAt || Date.now()
   const record = {
     title: resolveTitleForCache(),
     officialTotal: state.officialTotal,
@@ -1245,11 +1263,16 @@ function writeCache() {
     baselineSource: state.baselineSource,
     attachmentTokens: state.attachmentTokens,
     messageCount: state.messageCount,
-    updatedAt: state.updatedAt || Date.now()
+    updatedAt
   }
 
   try {
-    chrome.storage.local.set({ [key]: record })
+    // 多标签页并发写同一会话时，以 updatedAt 较新的一方为准，避免旧值覆盖新值
+    chrome.storage.local.get(key, (res) => {
+      const prev = res && res[key]
+      if (prev && typeof prev.updatedAt === 'number' && prev.updatedAt > updatedAt) return
+      chrome.storage.local.set({ [key]: record })
+    })
   } catch {
     // 无扩展上下文时忽略
   }

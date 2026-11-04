@@ -24,12 +24,20 @@ let lastHistoryRequest = null
 let currentSessionId = null
 let lastAuthHeader = null
 
+const MAX_SESSIONS = 200
+const MAX_FILES = 200
+
 function getSession(sessionId) {
   if (!sessions.has(sessionId)) {
+    // 上限保护：会话状态只增不减会在长时间 SPA 使用中累积
+    if (sessions.size >= MAX_SESSIONS) {
+      const oldest = sessions.keys().next().value
+      if (oldest !== sessionId) sessions.delete(oldest)
+    }
     sessions.set(sessionId, {
       latest: null,
+      turnHasUsage: false,
       postTotal: null,
-      prevPostTotal: null,
       files: []
     })
   }
@@ -40,6 +48,8 @@ function getSession(sessionId) {
 
 function createSseParser(sessionId) {
   const state = getSession(sessionId)
+  // 保留上一轮的值：本轮还没拿到新值前，界面继续显示旧值
+  state.turnHasUsage = false
   let buffer = ''
   let rawTail = ''
 
@@ -47,7 +57,8 @@ function createSseParser(sessionId) {
     push(text) {
       if (!text) return
       rawTail = (rawTail + text).slice(-RAW_TAIL_LIMIT)
-      buffer += text
+      // 兼容 CRLF / 单独 CR 的 SSE 帧分隔，避免整段拼成非法 JSON
+      buffer = (buffer + text).replace(/\r\n?/g, '\n')
 
       let splitIndex = buffer.indexOf('\n\n')
       while (splitIndex !== -1) {
@@ -63,11 +74,12 @@ function createSseParser(sessionId) {
         buffer = ''
       }
       // 兜底：整段响应不是标准 SSE 时，直接从原文里抓最后一个数字
-      if (state.latest === null) {
+      if (!state.turnHasUsage) {
         const matches = [...rawTail.matchAll(/"accumulated_token_usage"\s*:\s*(\d+)/g)]
         const last = matches.length ? Number(matches[matches.length - 1][1]) : null
         if (last !== null) {
           state.latest = last
+          state.turnHasUsage = true
           console.log(TAG, '📊 兜底抓到 accumulated_token_usage =', last)
         }
       }
@@ -98,9 +110,24 @@ function handleFrame(frame, sessionId, state) {
     const tokens = findFirst(json, 'token_usage')
     if (typeof tokens === 'number') {
       const isImage = findFirst(json, 'is_image') === true
-      state.files.push({ tokens, isImage })
-      console.log(TAG, '📎 附件用量', { tokens, isImage })
-      postToContent('file-usage', { sessionId, tokens, isImage })
+      // 同一文件可能先来估算帧、再来精确帧：按 file_id 去重并取最新值
+      const fileId =
+        [findFirst(json, 'file_id'), findFirst(json, 'filename'), findFirst(json, 'name')]
+          .find((value) => typeof value === 'string' && value) || null
+
+      const existing = fileId ? state.files.find((file) => file.id === fileId) : null
+      if (existing) {
+        existing.tokens = tokens
+      } else {
+        state.files.push({ id: fileId, tokens, isImage })
+        if (state.files.length > MAX_FILES) {
+          state.files.splice(0, state.files.length - MAX_FILES)
+        }
+      }
+
+      const total = state.files.reduce((sum, file) => sum + (file.tokens || 0), 0)
+      console.log(TAG, '📎 附件用量', { tokens, isImage, total })
+      postToContent('file-usage', { sessionId, tokens, isImage, total })
     }
     return
   }
@@ -110,6 +137,7 @@ function handleFrame(frame, sessionId, state) {
   // 0 是首轮早期的占位值，不作为有效统计
   if (typeof usage === 'number' && usage > 0 && state.latest !== usage) {
     state.latest = usage
+    state.turnHasUsage = true
     console.log(TAG, '📊 accumulated_token_usage =', usage)
     postToContent('usage', {
       sessionId,
@@ -132,8 +160,8 @@ function reportEnd(sessionId, state) {
     attachmentTokens: state.files.reduce((sum, f) => sum + (f.tokens || 0), 0)
   })
 
-  if (state.latest != null) {
-    // 稍等片刻再校准，避免服务端尚未落库时拿到旧快照
+  if (state.turnHasUsage) {
+    // 只有本轮真的抓到用量才校准，避免无意义的重复请求
     setTimeout(() => syncAfterTurn(sessionId), 600)
   }
 }
@@ -149,8 +177,55 @@ async function syncAfterTurn(sessionId) {
   // 新对话没有可复用的历史请求模板，改用一次全量请求（此时消息很少，成本低）
   const url = hasTemplate ? replaceParam(lastHistoryRequest.url, 'chat_session_id', sessionId) : buildHistoryUrl(sessionId)
 
+  let result = await requestHistory(url, hasTemplate ? 8000 : 4000)
+  // 新对话可能尚未落库：退避 1.2 秒再试一次
+  if (!hasTemplate && (!result || result.count <= 0)) {
+    console.log(TAG, '🗂 落库校准：首轮为空，1.2s 后重试')
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    result = await requestHistory(url, 4000)
+  }
+  if (!result) {
+    console.warn(TAG, '🗂 落库校准失败（不影响主流程）')
+    return
+  }
+  if (result.count <= 0) {
+    console.log(TAG, '🗂 落库校准：没有新消息，跳过')
+    return
+  }
+
+  const ok = applyHistory(sessionId, result.text, 'after-turn')
+  if (!ok) return
+
+  // 全量请求没有版本号，若响应里带回版本信息，就把它沉淀成后续增量模板
+  if (!hasTemplate && result.json) {
+    const cacheVersion = findFirst(result.json, 'cache_version')
+    if (cacheVersion != null) {
+      lastHistoryRequest = {
+        url: `/api/v0/chat/history_messages?chat_session_id=${sessionId}&cache_version=${cacheVersion}&cache_reset_at=${findFirst(result.json, 'cache_reset_at') || 0}`,
+        headers: lastHistoryRequest ? lastHistoryRequest.headers : {}
+      }
+      console.log(TAG, `🗂 已沉淀增量模板 cache_version=${cacheVersion}`)
+    }
+  }
+
+  const state = getSession(sessionId)
+  const total = state.postTotal
+  // 只有真正向前增长才算本轮；0 或负数视为尚未落库，不覆盖已有本轮值
+  const roundTokens = before != null && total != null && total > before ? total - before : null
+
+  console.log(TAG, `🗂 落库校准 total=${total} prev=${before} round=${roundTokens} via=${hasTemplate ? 'incremental' : 'full'}`)
+
+  postToContent('post-turn', {
+    sessionId,
+    total,
+    roundTokens,
+    roundSource: roundTokens != null ? 'post-turn' : 'unknown'
+  })
+}
+
+async function requestHistory(url, timeoutMs) {
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
-  const timer = controller ? setTimeout(() => controller.abort(), hasTemplate ? 8000 : 4000) : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
 
   try {
     const res = await origFetch(url, {
@@ -159,46 +234,14 @@ async function syncAfterTurn(sessionId) {
       credentials: 'include',
       signal: controller ? controller.signal : undefined
     })
-    if (!res.ok) return
+    if (!res.ok) return null
 
     const text = await res.text()
     const json = safeParse(text)
     const count = json ? (findMessageArray(json).arr || []).length : 0
-    if (count <= 0) {
-      console.log(TAG, '🗂 落库校准：没有新消息，跳过')
-      return
-    }
-
-    const ok = applyHistory(sessionId, text, 'after-turn')
-    if (!ok) return
-
-    // 全量请求没有版本号，若响应里带回版本信息，就把它沉淀成后续增量模板
-    if (!hasTemplate && json) {
-      const cacheVersion = findFirst(json, 'cache_version')
-      if (cacheVersion != null) {
-        lastHistoryRequest = {
-          url: `/api/v0/chat/history_messages?chat_session_id=${sessionId}&cache_version=${cacheVersion}&cache_reset_at=${findFirst(json, 'cache_reset_at') || 0}`,
-          headers: lastHistoryRequest ? lastHistoryRequest.headers : {}
-        }
-        console.log(TAG, `🗂 已沉淀增量模板 cache_version=${cacheVersion}`)
-      }
-    }
-
-    const state = getSession(sessionId)
-    const total = state.postTotal
-    // 只有真正向前增长才算本轮；0 或负数视为尚未落库，不覆盖已有本轮值
-    const roundTokens = before != null && total != null && total > before ? total - before : null
-
-    console.log(TAG, `🗂 落库校准 total=${total} prev=${before} round=${roundTokens} via=${hasTemplate ? 'incremental' : 'full'}`)
-
-    postToContent('post-turn', {
-      sessionId,
-      total,
-      roundTokens,
-      roundSource: roundTokens != null ? 'post-turn' : 'unknown'
-    })
-  } catch (err) {
-    console.warn(TAG, '🗂 落库校准失败（不影响主流程）', err)
+    return { text, json, count }
+  } catch {
+    return null
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -261,7 +304,6 @@ function applyHistory(sessionId, text, source) {
   const state = getSession(sessionId)
   currentSessionId = sessionId
   state.postTotal = baseline
-  state.prevPostTotal = baseline
   if (baseline != null && state.latest === null) state.latest = baseline
 
   const ok = baseline != null || (messages && messages.length > 0)
@@ -282,6 +324,8 @@ function applyHistory(sessionId, text, source) {
     baselineSource,
     messageCount: messages ? messages.length : 0,
     source,
+    // 自动落库校准不能干扰用户手动刷新时的转圈与提示
+    auto: source === 'after-turn',
     ok,
     title: typeof title === 'string' ? title : null
   })
@@ -293,15 +337,15 @@ function findMessageArray(node, depth = 0, best = { arr: null, len: 0 }) {
   if (!node || typeof node !== 'object' || depth > 8) return best
 
   if (Array.isArray(node)) {
-    const looksLikeMessages =
-      node.length > 0 &&
-      node.every(
-        (item) =>
-          item &&
-          typeof item === 'object' &&
-          !Array.isArray(item) &&
-          ('content' in item || 'message_id' in item || 'role' in item)
-      )
+    // 放宽校验：多数元素像消息即可，避免一条 tool/system 特殊结构导致整体识别失败
+    const hits = node.filter(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        !Array.isArray(item) &&
+        ('content' in item || 'message_id' in item || 'role' in item)
+    ).length
+    const looksLikeMessages = node.length > 0 && hits >= Math.max(1, Math.ceil(node.length * 0.6))
     if (looksLikeMessages && node.length > best.len) {
       best.arr = node
       best.len = node.length
@@ -642,6 +686,7 @@ window.fetch = async function (input, init) {
       return response
     }
     console.log(TAG, '🎯 拦截到 completion（fetch）', { sessionId, url })
+    currentSessionId = sessionId
 
     // clone() 拿到第二份流，页面继续消费原响应，互不影响
     const parser = createSseParser(sessionId)
@@ -680,6 +725,8 @@ async function parseStream(stream, parser) {
   } finally {
     // 必须收尾：否则本轮不结束、下一轮的本轮值会虚高
     try {
+      const tail = decoder.decode()
+      if (tail) parser.push(tail)
       parser.flush()
     } catch (err) {
       console.warn(TAG, 'flush 失败', err)
@@ -866,7 +913,7 @@ function findFirst(node, key, depth = 0) {
 }
 
 function postToContent(type, payload) {
-  window.postMessage({ source: 'deepbrim', type, payload }, '*')
+  window.postMessage({ source: 'deepbrim', type, payload }, location.origin)
 }
 
 // 控制台调试入口：__deepbrim.refreshHistory('会话ID')
