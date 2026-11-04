@@ -10,6 +10,7 @@ const PRESETS = [1000000, 128000, 64000]
 const POS_KEY = 'deepbrim.pos'
 const LIMIT_KEY = 'deepbrim.limit'
 const THEME_KEY = 'deepbrim.theme'
+const AUTO_CLEAR_KEY = 'deepbrim.autoClear'
 const CACHE_PREFIX = 'deepbrim.cache.'
 const CACHE_INDEX_KEY = 'deepbrim.cacheIndex'
 const MAX_CACHE_ENTRIES = 200
@@ -45,6 +46,8 @@ let settingsModal
 let settingsBackdrop
 let settingsTab = 'basic'
 let themeChoice = 'auto'
+// 自动清除缓存：保留最近 N 天更新过的会话缓存，0 表示关闭；默认 30 天
+let autoClearDays = 30
 let themeObserver = null
 let bodyThemeObserved = false
 let dragging = false
@@ -56,6 +59,9 @@ let pendingSlowTimer = null
 let pendingDeleteId = null
 let pendingHardRefresh = false
 let contractWarned = false
+// 未手动拖拽过、位置仍由输入框锚定
+let anchorMode = false
+let anchorRetryTimer = null
 
 init()
 
@@ -89,7 +95,8 @@ function init() {
 
   bindEvents()
   startUrlPolling()
-  syncLimitSelect()
+  initLimit()
+  initAutoClear()
 
   // document_start 阶段 documentElement 不保证已存在，等挂载成功后再布局
   mountWhenReady(() => {
@@ -373,9 +380,9 @@ function template() {
         display: flex;
         justify-content: space-between;
         align-items: baseline;
-        font-size: 13px;
+        font-size: 15px;
         font-weight: 600;
-        margin-bottom: 10px;
+        margin-bottom: 12px;
       }
       .db-settings-close {
         position: absolute;
@@ -384,8 +391,16 @@ function template() {
         z-index: 2;
       }
 
-      .db-field { margin-bottom: 8px; }
+      .db-field { margin-bottom: 16px; }
+      .db-field:last-child { margin-bottom: 0; }
       .db-field label { display: block; font-size: 11px; color: #6b7280; margin-bottom: 3px; }
+      .db-subtitle {
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.3;
+        color: #4b5563;
+        margin-bottom: 6px;
+      }
       .db-field select, .db-field input {
         width: 100%;
         height: 26px;
@@ -397,7 +412,13 @@ function template() {
         font-size: 12px;
       }
       .db-limit-custom { margin-top: 5px; }
-      .db-msg { min-height: 14px; margin: 3px 0 0; font-size: 11px; color: #6b7280; }
+      .db-msg {
+        margin: 6px 0 0;
+        font-size: 10.5px;
+        line-height: 1.5;
+        color: #9ca3af;
+      }
+      .db-msg:empty { display: none; }
       .db-msg.error { color: #dc2626; }
       .db-msg.ok { color: #16a34a; }
 
@@ -564,6 +585,7 @@ function template() {
       }
       :host([data-db-theme="dark"]) .db-row .db-k,
       :host([data-db-theme="dark"]) .db-msg { color: #9ca3af; }
+      :host([data-db-theme="dark"]) .db-subtitle { color: #d1d5db; }
       :host([data-db-theme="dark"]) .db-sep { background: rgba(255, 255, 255, .08); }
       :host([data-db-theme="dark"]) .db-actions button {
         background: #242932;
@@ -681,7 +703,7 @@ function template() {
           <section class="db-settings-pane" data-pane="basic">
             <div class="db-pane-title">基础</div>
             <div class="db-field">
-              <label for="db-limit-select">上下文上限</label>
+              <div class="db-subtitle">上下文上限</div>
               <select id="db-limit-select" class="db-limit-select">
                 <option value="1000000">1,000,000（1M，默认）</option>
                 <option value="128000">128,000（128K）</option>
@@ -691,6 +713,15 @@ function template() {
               <input class="db-limit-custom" type="number" min="1000" max="10000000" step="1000"
                      placeholder="1000 – 10,000,000" hidden>
               <p class="db-msg db-limit-msg"></p>
+            </div>
+            <div class="db-field">
+              <div class="db-subtitle">自动清除缓存</div>
+              <select id="db-autoclear-select" class="db-autoclear-select">
+                <option value="30">超过 30 天未更新时清除（默认）</option>
+                <option value="14">超过 14 天未更新时清除</option>
+                <option value="7">超过 7 天未更新时清除</option>
+                <option value="0">关闭</option>
+              </select>
             </div>
           </section>
 
@@ -832,7 +863,6 @@ function bindEvents() {
     }
 
     customInput.hidden = true
-    showLimitMsg('')
     saveLimit(Number(value))
   })
 
@@ -858,6 +888,9 @@ function bindEvents() {
   shadow.querySelectorAll('.db-theme-btn').forEach((btn) => {
     btn.addEventListener('click', () => saveTheme(btn.dataset.themeChoice))
   })
+
+  const autoClearSelect = shadow.querySelector('.db-autoclear-select')
+  autoClearSelect.addEventListener('change', () => saveAutoClear(Number(autoClearSelect.value)))
 
   settingsBackdrop.addEventListener('click', closeSettings)
 
@@ -890,7 +923,9 @@ function bindEvents() {
   })
 
   window.addEventListener('resize', () => {
-    clampDiscPosition()
+    // 尚未手动拖拽过：继续贴住输入框右下角
+    if (anchorMode) placeAtInputCorner()
+    else clampDiscPosition()
     if (panel.classList.contains('db-open')) positionPanel()
     positionAbs()
     positionConfirm()
@@ -921,6 +956,11 @@ function bindEvents() {
         applyTheme()
         syncThemeButtons()
       }
+
+      if (changes[AUTO_CLEAR_KEY]) {
+        autoClearDays = normalizeAutoClear(changes[AUTO_CLEAR_KEY].newValue)
+        syncAutoClearSelect()
+      }
     })
   } catch {
     // 无扩展上下文时忽略
@@ -943,6 +983,7 @@ function openSettings() {
   cancelDelete()
   syncLimitSelect()
   syncThemeButtons()
+  syncAutoClearSelect()
   settingsModal.classList.add('db-open')
   settingsBackdrop.classList.add('db-open')
   switchSettingsTab(settingsTab)
@@ -965,6 +1006,8 @@ function switchSettingsTab(tab) {
   })
 
   if (tab === 'cache') loadCacheList()
+  // 切页时清掉上一页留下的提示
+  showLimitMsg('')
 }
 
 function calibrateCache() {
@@ -1325,6 +1368,95 @@ function removeCacheIndex(id) {
   }
 }
 
+/* ---------------- 自动清除缓存 ---------------- */
+
+function normalizeAutoClear(value) {
+  return value === 0 || value === 7 || value === 14 || value === 30 ? value : 30
+}
+
+function initAutoClear() {
+  try {
+    chrome.storage.local.get(AUTO_CLEAR_KEY, (res) => {
+      autoClearDays = normalizeAutoClear(res && res[AUTO_CLEAR_KEY])
+      syncAutoClearSelect()
+      purgeOldCache()
+    })
+  } catch {
+    syncAutoClearSelect()
+  }
+}
+
+function saveAutoClear(days) {
+  autoClearDays = normalizeAutoClear(days)
+  syncAutoClearSelect()
+
+  try {
+    chrome.storage.local.set({ [AUTO_CLEAR_KEY]: autoClearDays })
+  } catch {
+    // 无扩展上下文时忽略
+  }
+
+  if (autoClearDays) purgeOldCache()
+}
+
+function syncAutoClearSelect() {
+  const select = shadow.querySelector('.db-autoclear-select')
+  if (select) select.value = String(autoClearDays)
+}
+
+// 清理超过 autoClearDays 天未更新的会话缓存
+function purgeOldCache() {
+  const days = autoClearDays
+  if (!days) return
+
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
+
+  try {
+    chrome.storage.local.get(CACHE_INDEX_KEY, (res) => {
+      const index = res && res[CACHE_INDEX_KEY]
+
+      if (index && Object.keys(index).length) {
+        const stale = Object.keys(index).filter((id) => {
+          const updatedAt = index[id]
+          return typeof updatedAt === 'number' && updatedAt > 0 && updatedAt < cutoff
+        })
+        if (stale.length) removeStaleCaches(stale, days)
+        return
+      }
+
+      // 索引缺失（首次升级）：全量扫一次，清理后顺带重建索引
+      chrome.storage.local.get(null, (all) => {
+        const stale = []
+        const keep = {}
+        for (const [key, rec] of Object.entries(all || {})) {
+          if (!key.startsWith(CACHE_PREFIX)) continue
+          const id = key.slice(CACHE_PREFIX.length)
+          const updatedAt = (rec && rec.updatedAt) || 0
+          if (updatedAt && updatedAt < cutoff) stale.push(id)
+          else keep[id] = updatedAt
+        }
+        if (!stale.length) return
+        removeStaleCaches(stale, days, keep)
+      })
+    })
+  } catch {
+    // 忽略
+  }
+}
+
+function removeStaleCaches(staleIds, days, keepIndex) {
+  chrome.storage.local.remove(staleIds.map((id) => CACHE_PREFIX + id), () => {
+    chrome.storage.local.get(CACHE_INDEX_KEY, (res) => {
+      const index = Object.assign({}, (res && res[CACHE_INDEX_KEY]) || {}, keepIndex || {})
+      for (const id of staleIds) delete index[id]
+      chrome.storage.local.set({ [CACHE_INDEX_KEY]: index }, () => {
+        if (settingsModal.classList.contains('db-open')) loadCacheList()
+      })
+    })
+    console.log(TAG, `🧹 自动清除 ${staleIds.length} 条超过 ${days} 天未更新的会话缓存`)
+  })
+}
+
 function loadCacheList() {
   const listEl = shadow.querySelector('.db-cache-list')
   const countEl = shadow.querySelector('.db-cache-count')
@@ -1461,6 +1593,20 @@ function confirmDelete() {
 
 /* ---------------- 设置 ---------------- */
 
+// 启动时读取已保存的上限，避免刷新页面后回落到默认值
+function initLimit() {
+  try {
+    chrome.storage.local.get(LIMIT_KEY, (res) => {
+      const value = res && res[LIMIT_KEY]
+      if (isValidLimit(value)) state.limit = value
+      syncLimitSelect()
+      render()
+    })
+  } catch {
+    syncLimitSelect()
+  }
+}
+
 function syncLimitSelect() {
   const select = shadow.querySelector('.db-limit-select')
   const customInput = shadow.querySelector('.db-limit-custom')
@@ -1474,6 +1620,9 @@ function syncLimitSelect() {
     customInput.hidden = false
     customInput.value = String(state.limit)
   }
+
+  // 提示只在本次保存后短暂显示，切页或重开弹窗时清空
+  showLimitMsg('')
 }
 
 function commitCustomLimit() {
@@ -1884,6 +2033,8 @@ function positionConfirm() {
 }
 
 function savePosition() {
+  anchorMode = false
+  clearTimeout(anchorRetryTimer)
   const rect = disc.getBoundingClientRect()
   const pos = {
     x: rect.left / window.innerWidth,
@@ -1896,22 +2047,85 @@ function savePosition() {
   }
 }
 
+// 没有保存坐标时，默认贴在输入框右下角：
+// 圆盘下边对齐输入框下边，圆盘左边对齐输入框右边
+function placeAtInputCorner(attempt = 0) {
+  if (!anchorMode) return
+
+  const rect = findInputBoxRect()
+  if (!rect) {
+    // 页面初始化阶段输入框可能还没渲染，短暂重试
+    if (attempt < 20) {
+      anchorRetryTimer = setTimeout(() => placeAtInputCorner(attempt + 1), 250)
+    }
+    return
+  }
+
+  const size = disc.getBoundingClientRect().width || 56
+  setDiscPosition(rect.right, rect.bottom - size)
+  clampDiscPosition()
+  positionAbs()
+  if (panel.classList.contains('db-open')) positionPanel()
+}
+
+// 找到底部输入条的完整外框（比 textarea 大，含发送按钮等操作区）
+function findInputBoxRect() {
+  const nodes = Array.from(document.querySelectorAll('textarea, [contenteditable="true"]'))
+  const candidates = []
+
+  for (const node of nodes) {
+    const rect = node.getBoundingClientRect()
+    if (rect.width < 120 || rect.height < 16) continue
+    if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue
+    const style = getComputedStyle(node)
+    if (style.display === 'none' || style.visibility === 'hidden') continue
+    candidates.push({ node, rect })
+  }
+  if (!candidates.length) return null
+
+  // DeepSeek 只有一个输入框，取最靠下的那个
+  candidates.sort((a, b) => b.rect.bottom - a.rect.bottom)
+  const { node, rect } = candidates[0]
+
+  let box = rect
+  let current = node
+  for (let depth = 0; depth < 4; depth++) {
+    const parent = current.parentElement
+    if (!parent) break
+
+    const p = parent.getBoundingClientRect()
+    if (p.width < box.width || p.height < box.height) break
+    if (box.left < p.left - 1 || box.right > p.right + 1) break
+    if (box.top < p.top - 1 || box.bottom > p.bottom + 1) break
+    // 再往上就是整列或整页，高度会明显变大
+    if (p.height > Math.max(box.height * 3, 220)) break
+
+    box = p
+    current = parent
+  }
+
+  return box
+}
+
 function restorePosition() {
-  try {
-    chrome.storage.local.get(POS_KEY, (res) => {
-      const pos = res && res[POS_KEY]
-      if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
-        setDiscPosition(pos.x * window.innerWidth, pos.y * window.innerHeight)
-      } else {
-        setDiscPosition(window.innerWidth - 56 - 24, window.innerHeight - 56 - 96)
-      }
-      clampDiscPosition()
-      positionAbs()
-      if (panel.classList.contains('db-open')) positionPanel()
-    })
-  } catch {
-    setDiscPosition(window.innerWidth - 56 - 24, window.innerHeight - 56 - 96)
+  const apply = (pos) => {
+    if (pos && typeof pos.x === 'number' && typeof pos.y === 'number') {
+      anchorMode = false
+      clearTimeout(anchorRetryTimer)
+      setDiscPosition(pos.x * window.innerWidth, pos.y * window.innerHeight)
+    } else {
+      anchorMode = true
+      placeAtInputCorner()
+    }
+    clampDiscPosition()
     positionAbs()
+    if (panel.classList.contains('db-open')) positionPanel()
+  }
+
+  try {
+    chrome.storage.local.get(POS_KEY, (res) => apply(res && res[POS_KEY]))
+  } catch {
+    apply(null)
   }
 }
 
