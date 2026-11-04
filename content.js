@@ -11,6 +11,8 @@ const POS_KEY = 'deepbrim.pos'
 const LIMIT_KEY = 'deepbrim.limit'
 const THEME_KEY = 'deepbrim.theme'
 const CACHE_PREFIX = 'deepbrim.cache.'
+const CACHE_INDEX_KEY = 'deepbrim.cacheIndex'
+const MAX_CACHE_ENTRIES = 200
 const CACHE_DEBOUNCE = 2000
 const URL_POLL_MS = 500
 
@@ -53,6 +55,7 @@ let pendingTimer = null
 let pendingSlowTimer = null
 let pendingDeleteId = null
 let pendingHardRefresh = false
+let contractWarned = false
 
 init()
 
@@ -1138,6 +1141,15 @@ function handleData(msg) {
     return
   }
 
+  if (type === 'contract-warning') {
+    if (!contractWarned) {
+      contractWarned = true
+      console.warn(TAG, '⚠️ 连续多轮解析不到 Token 字段，站点接口可能已改版')
+      showToast('站点可能改版，Token 统计已失效', { timeout: 4000 })
+    }
+    return
+  }
+
   if (type === 'usage') {
     if (payload.total != null && payload.total > 0) {
       // 新一轮的第一帧：清掉上一轮的本轮值，避免显示残留数字
@@ -1253,7 +1265,8 @@ function writeCache() {
   if (!state.sessionId) return
   if (state.officialTotal == null && state.baselineValue == null) return
 
-  const key = CACHE_PREFIX + state.sessionId
+  const id = state.sessionId
+  const key = CACHE_PREFIX + id
   const updatedAt = state.updatedAt || Date.now()
   const record = {
     title: resolveTitleForCache(),
@@ -1271,10 +1284,44 @@ function writeCache() {
     chrome.storage.local.get(key, (res) => {
       const prev = res && res[key]
       if (prev && typeof prev.updatedAt === 'number' && prev.updatedAt > updatedAt) return
-      chrome.storage.local.set({ [key]: record })
+      chrome.storage.local.set({ [key]: record }, () => updateCacheIndex(id, updatedAt))
     })
   } catch {
     // 无扩展上下文时忽略
+  }
+}
+
+// 维护会话索引，避免列表用 get(null) 全量拉取；同时承担 LRU 淘汰
+function updateCacheIndex(id, updatedAt) {
+  try {
+    chrome.storage.local.get(CACHE_INDEX_KEY, (res) => {
+      const index = Object.assign({}, (res && res[CACHE_INDEX_KEY]) || {})
+      index[id] = updatedAt
+
+      const sorted = Object.entries(index).sort((a, b) => b[1] - a[1])
+      const keep = sorted.slice(0, MAX_CACHE_ENTRIES)
+      const drop = sorted.slice(MAX_CACHE_ENTRIES)
+
+      chrome.storage.local.set({ [CACHE_INDEX_KEY]: Object.fromEntries(keep) })
+      if (drop.length) {
+        chrome.storage.local.remove(drop.map(([sid]) => CACHE_PREFIX + sid))
+        console.log(TAG, `🗂 缓存 LRU 清理 ${drop.length} 条`)
+      }
+    })
+  } catch {
+    // 忽略
+  }
+}
+
+function removeCacheIndex(id) {
+  try {
+    chrome.storage.local.get(CACHE_INDEX_KEY, (res) => {
+      const index = Object.assign({}, (res && res[CACHE_INDEX_KEY]) || {})
+      delete index[id]
+      chrome.storage.local.set({ [CACHE_INDEX_KEY]: index })
+    })
+  } catch {
+    // 忽略
   }
 }
 
@@ -1284,27 +1331,58 @@ function loadCacheList() {
   listEl.textContent = ''
 
   try {
-    chrome.storage.local.get(null, (all) => {
-      const entries = Object.keys(all || {})
-        .filter((key) => key.startsWith(CACHE_PREFIX))
-        .map((key) => ({ id: key.slice(CACHE_PREFIX.length), rec: all[key] }))
-        .sort((a, b) => (b.rec.updatedAt || 0) - (a.rec.updatedAt || 0))
+    chrome.storage.local.get(CACHE_INDEX_KEY, (res) => {
+      const index = res && res[CACHE_INDEX_KEY]
+      const ids = index ? Object.keys(index) : []
 
-      countEl.textContent = entries.length ? `${entries.length} 个` : '暂无'
-
-      if (!entries.length) {
-        const empty = document.createElement('div')
-        empty.className = 'db-cache-empty'
-        empty.textContent = '还没有缓存记录'
-        listEl.appendChild(empty)
+      if (ids.length) {
+        // 有索引：只按需读取这些 key，避免全量拉取
+        chrome.storage.local.get(ids.map((id) => CACHE_PREFIX + id), (all) => {
+          const entries = ids
+            .sort((a, b) => (index[b] || 0) - (index[a] || 0))
+            .map((id) => ({ id, rec: all && all[CACHE_PREFIX + id] }))
+            .filter((entry) => entry.rec)
+          renderCacheEntries(listEl, countEl, entries)
+        })
         return
       }
 
-      for (const entry of entries) listEl.appendChild(cacheRow(entry.id, entry.rec))
+      // 首次升级：没有索引时兜底全量读一次，并重建索引
+      chrome.storage.local.get(null, (all) => {
+        const entries = Object.keys(all || {})
+          .filter((key) => key.startsWith(CACHE_PREFIX))
+          .map((key) => ({ id: key.slice(CACHE_PREFIX.length), rec: all[key] }))
+          .sort((a, b) => (b.rec.updatedAt || 0) - (a.rec.updatedAt || 0))
+
+        renderCacheEntries(listEl, countEl, entries)
+
+        const rebuilt = entries.slice(0, MAX_CACHE_ENTRIES)
+        chrome.storage.local.set({
+          [CACHE_INDEX_KEY]: Object.fromEntries(rebuilt.map((entry) => [entry.id, entry.rec.updatedAt || 0]))
+        })
+        if (entries.length > MAX_CACHE_ENTRIES) {
+          chrome.storage.local.remove(entries.slice(MAX_CACHE_ENTRIES).map((entry) => CACHE_PREFIX + entry.id))
+        }
+      })
     })
   } catch {
     countEl.textContent = '不可用'
   }
+}
+
+function renderCacheEntries(listEl, countEl, entries) {
+  listEl.textContent = ''
+  countEl.textContent = entries.length ? `${entries.length} 个` : '暂无'
+
+  if (!entries.length) {
+    const empty = document.createElement('div')
+    empty.className = 'db-cache-empty'
+    empty.textContent = '还没有缓存记录'
+    listEl.appendChild(empty)
+    return
+  }
+
+  for (const entry of entries) listEl.appendChild(cacheRow(entry.id, entry.rec))
 }
 
 function cacheRow(id, rec) {
@@ -1371,6 +1449,7 @@ function confirmDelete() {
 
   try {
     chrome.storage.local.remove(CACHE_PREFIX + id, () => {
+      removeCacheIndex(id)
       if (state.sessionId === id) state.fromCache = false
       loadCacheList()
       showToast('✓ 已删除该会话缓存')

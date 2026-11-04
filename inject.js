@@ -23,6 +23,7 @@ const sessions = new Map()
 let lastHistoryRequest = null
 let currentSessionId = null
 let lastAuthHeader = null
+let contractWarned = false
 
 const MAX_SESSIONS = 200
 const MAX_FILES = 200
@@ -37,6 +38,7 @@ function getSession(sessionId) {
     sessions.set(sessionId, {
       latest: null,
       turnHasUsage: false,
+      missCount: 0,
       postTotal: null,
       files: []
     })
@@ -50,6 +52,7 @@ function createSseParser(sessionId) {
   const state = getSession(sessionId)
   // 保留上一轮的值：本轮还没拿到新值前，界面继续显示旧值
   state.turnHasUsage = false
+  state.turnHasFrame = false
   let buffer = ''
   let rawTail = ''
 
@@ -104,6 +107,7 @@ function handleFrame(frame, sessionId, state) {
 
   const json = safeParse(dataLines.join('\n'))
   if (!json) return
+  state.turnHasFrame = true
 
   // 附件：官方直接给 token_usage
   if (event === 'update_file') {
@@ -161,8 +165,17 @@ function reportEnd(sessionId, state) {
   })
 
   if (state.turnHasUsage) {
+    state.missCount = 0
     // 只有本轮真的抓到用量才校准，避免无意义的重复请求
     setTimeout(() => syncAfterTurn(sessionId), 600)
+  } else if (state.turnHasFrame) {
+    // 契约探针：连续多轮有正常帧却解析不到字段，基本可以判定站点改版
+    state.missCount = (state.missCount || 0) + 1
+    console.warn(TAG, `⚠️ 本轮未解析到 accumulated_token_usage（连续 ${state.missCount} 轮）`)
+    if (state.missCount >= 3 && !contractWarned) {
+      contractWarned = true
+      postToContent('contract-warning', { sessionId })
+    }
   }
 }
 
