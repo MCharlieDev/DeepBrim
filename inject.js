@@ -4,6 +4,8 @@
 const TAG = '[DeepBrim]'
 const COMPLETION_PATH = '/chat/completion'
 const HISTORY_PATH = '/chat/history_messages'
+// 连请求模板都还没捕获到时的最后兜底路径（匹配用 HISTORY_PATH，发请求用这个）
+const HISTORY_FALLBACK_PATH = '/api/v0/chat/history_messages'
 const DEBUG = true
 const RAW_TAIL_LIMIT = 64 * 1024
 
@@ -213,9 +215,11 @@ async function syncAfterTurn(sessionId) {
   if (!hasTemplate && result.json) {
     const cacheVersion = findFirst(result.json, 'cache_version')
     if (cacheVersion != null) {
+      // 路径从真实响应 URL 推导，兼容 API 版本变化
+      const baseUrl = result.url || url
       lastHistoryRequest = {
-        url: `/api/v0/chat/history_messages?chat_session_id=${sessionId}&cache_version=${cacheVersion}&cache_reset_at=${findFirst(result.json, 'cache_reset_at') || 0}`,
-        headers: lastHistoryRequest ? lastHistoryRequest.headers : {}
+        url: buildIncrementalUrl(baseUrl, sessionId, cacheVersion, findFirst(result.json, 'cache_reset_at')),
+        headers: result.headers || {}
       }
       console.log(TAG, `🗂 已沉淀增量模板 cache_version=${cacheVersion}`)
     }
@@ -241,9 +245,10 @@ async function requestHistory(url, timeoutMs) {
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
 
   try {
+    const headers = buildAuthHeaders()
     const res = await origFetch(url, {
       method: 'GET',
-      headers: buildAuthHeaders(),
+      headers,
       credentials: 'include',
       signal: controller ? controller.signal : undefined
     })
@@ -252,7 +257,7 @@ async function requestHistory(url, timeoutMs) {
     const text = await res.text()
     const json = safeParse(text)
     const count = json ? (findMessageArray(json).arr || []).length : 0
-    return { text, json, count }
+    return { text, json, count, url: res.url || url, headers }
   } catch {
     return null
   } finally {
@@ -491,7 +496,8 @@ async function hardRefreshHistory(sessionId, hasCache) {
 
     if (!res.ok) {
       console.warn(TAG, '🗂 主动拉取失败，回退到请求头复放')
-      await refreshHistory(target)
+      const fallback = await refreshHistory(target)
+      if (!fallback) reportRefreshFailed(target)
       return
     }
 
@@ -504,12 +510,19 @@ async function hardRefreshHistory(sessionId, hasCache) {
         return
       }
       console.warn(TAG, '🗂 主动拉取没拿到有效数据，回退到请求头复放')
-      await refreshHistory(target)
+      const fallback = await refreshHistory(target)
+      if (!fallback) reportRefreshFailed(target)
     }
   } catch (err) {
     console.warn(TAG, '🗂 主动拉取异常，回退到请求头复放', err)
-    await refreshHistory(target)
+    const fallback = await refreshHistory(target)
+    if (!fallback) reportRefreshFailed(target)
   }
+}
+
+// 两条兜底路径都失败时也要让前端收尾，避免转圈干等 30 秒超时
+function reportRefreshFailed(sessionId) {
+  postToContent('sync-status', { sessionId, status: 'failed' })
 }
 
 // 一次性探针：判断 history_messages 是否支持 limit 类参数
@@ -525,7 +538,7 @@ async function probeLimit(sessionId) {
   }
 
   const headers = buildAuthHeaders()
-  const base = (lastHistoryRequest && lastHistoryRequest.url) || HISTORY_PATH
+  const base = (lastHistoryRequest && lastHistoryRequest.url) || HISTORY_FALLBACK_PATH
   let baseUrl
 
   try {
@@ -588,7 +601,7 @@ async function probeLimit(sessionId) {
 }
 
 function buildHistoryUrl(sessionId) {
-  const base = (lastHistoryRequest && lastHistoryRequest.url) || HISTORY_PATH
+  const base = (lastHistoryRequest && lastHistoryRequest.url) || HISTORY_FALLBACK_PATH
   try {
     const parsed = new URL(base, location.href)
     parsed.searchParams.set('chat_session_id', sessionId)
@@ -598,7 +611,23 @@ function buildHistoryUrl(sessionId) {
     parsed.searchParams.set('_t', String(Date.now()))
     return parsed.pathname + parsed.search
   } catch {
-    return `${HISTORY_PATH}?chat_session_id=${encodeURIComponent(sessionId)}&_t=${Date.now()}`
+    return `${HISTORY_FALLBACK_PATH}?chat_session_id=${encodeURIComponent(sessionId)}&_t=${Date.now()}`
+  }
+}
+
+// 增量模板：沿用真实请求的路径，避免 API 版本变化后写死的路径失效
+function buildIncrementalUrl(baseUrl, sessionId, cacheVersion, cacheResetAt) {
+  try {
+    const parsed = new URL(baseUrl, location.href)
+    parsed.searchParams.set('chat_session_id', sessionId)
+    parsed.searchParams.set('cache_version', String(cacheVersion))
+    parsed.searchParams.set('cache_reset_at', String(cacheResetAt != null ? cacheResetAt : 0))
+    parsed.searchParams.delete('_t')
+    return parsed.pathname + parsed.search
+  } catch {
+    return `${HISTORY_FALLBACK_PATH}?chat_session_id=${encodeURIComponent(
+      sessionId
+    )}&cache_version=${cacheVersion}&cache_reset_at=${cacheResetAt || 0}`
   }
 }
 
@@ -685,7 +714,20 @@ window.fetch = async function (input, init) {
     if (DEBUG && url && url.includes('/api/')) {
       console.log(TAG, '🔍 fetch:', url)
     }
-    if (!url || !url.includes(COMPLETION_PATH)) return response
+    if (!url) return response
+
+    const isCompletion = url.includes(COMPLETION_PATH)
+    const isHistory = url.includes(HISTORY_PATH)
+    if (!isCompletion && !isHistory) return response
+
+    // fetch 侧同样记录请求头，避免站点迁移后鉴权只能靠 localStorage 兜底
+    const requestHeaders = captureRequestHeaders(input, init)
+    rememberAuthHeader(requestHeaders)
+
+    if (isHistory) {
+      captureHistoryResponse(url, response, requestHeaders)
+      return response
+    }
 
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/event-stream') || !response.body) {
@@ -709,6 +751,63 @@ window.fetch = async function (input, init) {
   }
 
   return response
+}
+
+// fetch 的 headers 可能是 Headers / 数组 / 普通对象，统一转成可复放的字典
+function captureRequestHeaders(input, init) {
+  const out = {}
+
+  try {
+    let source = null
+    if (init && init.headers) source = init.headers
+    else if (typeof Request !== 'undefined' && input instanceof Request) source = input.headers
+    if (!source) return out
+
+    const headers = new Headers(source)
+    headers.forEach((value, key) => {
+      out[key] = value
+    })
+  } catch {
+    // 解析失败时返回空字典，仍可依赖 XHR 路径
+  }
+
+  return out
+}
+
+function rememberAuthHeader(headers) {
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === 'authorization' && typeof value === 'string' && value) {
+      lastAuthHeader = value
+    }
+  }
+}
+
+// 历史请求可能是 fetch：读取 clone 响应体，与 XHR 路径共用同一套回补逻辑
+function captureHistoryResponse(url, response, headers) {
+  try {
+    const sessionId = getSessionIdFromUrl(url)
+
+    response
+      .clone()
+      .text()
+      .then((text) => {
+        if (!text) return
+        lastHistoryRequest = { url: absoluteUrl(url), headers }
+        console.log(TAG, '🗂 捕获到 history_messages 响应（fetch）', { sessionId })
+        applyHistory(sessionId, text, 'page')
+      })
+      .catch((err) => console.warn(TAG, '🗂 fetch 历史响应读取失败', err))
+  } catch (err) {
+    console.warn(TAG, '🗂 fetch 历史响应捕获失败', err)
+  }
+}
+
+function absoluteUrl(url) {
+  try {
+    return new URL(url, location.href).href
+  } catch {
+    return url
+  }
 }
 
 async function readRequestBody(input, init) {
@@ -929,11 +1028,21 @@ function postToContent(type, payload) {
   window.postMessage({ source: 'deepbrim', type, payload }, location.origin)
 }
 
-// 控制台调试入口：__deepbrim.refreshHistory('会话ID')
-window.__deepbrim = {
-  refreshHistory,
-  probeLimit,
-  state: (sessionId) => sessions.get(sessionId) || sessions
+// 控制台调试入口：只在 DEBUG 下挂载，且不暴露原始会话映射
+if (DEBUG) {
+  window.__deepbrim = {
+    refreshHistory,
+    probeLimit,
+    state: (sessionId) => {
+      if (sessionId) {
+        const session = sessions.get(sessionId)
+        return session
+          ? { latest: session.latest, postTotal: session.postTotal, fileCount: session.files.length }
+          : null
+      }
+      return { sessionCount: sessions.size }
+    }
+  }
 }
 
 // 浮层（isolated world）请求重拉 / 主动拉取历史

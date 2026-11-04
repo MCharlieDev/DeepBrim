@@ -1173,6 +1173,15 @@ function handleData(msg) {
   }
 
   if (type === 'sync-status') {
+    if (payload.status === 'failed') {
+      if (pendingHardRefresh) {
+        pendingHardRefresh = false
+        clearTimeout(pendingTimer)
+        stopSpin()
+        showToast('历史拉取失败，已保留缓存')
+      }
+      return
+    }
     if (pendingHardRefresh && (payload.status === 'up-to-date' || payload.status === 'no-session' || payload.status === 'empty')) {
       pendingHardRefresh = false
       clearTimeout(pendingTimer)
