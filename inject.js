@@ -42,7 +42,15 @@ function getSession(sessionId) {
       turnHasUsage: false,
       missCount: 0,
       postTotal: null,
-      files: []
+      files: [],
+      // 会话事实：用于区分“清过缓存的老对话”和“真正的新对话”
+      hasCompletion: false,
+      historyCount: null,
+      historyCtrl: null,
+      currentMessageId: null,
+      historyTitle: null,
+      // 同轮重连去重：记录最近一次触发落库校准的时间
+      lastSyncAt: 0
     })
   }
   return sessions.get(sessionId)
@@ -57,6 +65,7 @@ function createSseParser(sessionId) {
   state.turnHasFrame = false
   let buffer = ''
   let rawTail = ''
+  let aborted = false
 
   return {
     push(text) {
@@ -73,6 +82,10 @@ function createSseParser(sessionId) {
         splitIndex = buffer.indexOf('\n\n')
       }
     },
+    // 断线中断：区分“网络抖动”与“站点改版”，中断不参与契约告警计数
+    abort() {
+      aborted = true
+    },
     flush() {
       if (buffer.trim()) {
         handleFrame(buffer, sessionId, state)
@@ -80,17 +93,32 @@ function createSseParser(sessionId) {
       }
       // 兜底：整段响应不是标准 SSE 时，直接从原文里抓最后一个数字
       if (!state.turnHasUsage) {
-        const matches = [...rawTail.matchAll(/"accumulated_token_usage"\s*:\s*(\d+)/g)]
-        const last = matches.length ? Number(matches[matches.length - 1][1]) : null
+        const last = lastUsageFromRaw(rawTail)
         if (last !== null) {
           state.latest = last
           state.turnHasUsage = true
           console.log(TAG, '📊 兜底抓到 accumulated_token_usage =', last)
         }
       }
-      reportEnd(sessionId, state)
+      reportEnd(sessionId, state, aborted)
     }
   }
+}
+
+// 原文兜底同时兼容两种下发格式：直接字段与 {p,v} 补丁
+function lastUsageFromRaw(rawTail) {
+  const hits = []
+  for (const match of rawTail.matchAll(/"accumulated_token_usage"\s*:\s*(\d+)/g)) {
+    hits.push({ index: match.index || 0, value: Number(match[1]) })
+  }
+  for (const match of rawTail.matchAll(
+    /"p"\s*:\s*"accumulated_token_usage"\s*,\s*"v"\s*:\s*(\d+)/g
+  )) {
+    hits.push({ index: match.index || 0, value: Number(match[1]) })
+  }
+  if (!hits.length) return null
+  hits.sort((a, b) => a.index - b.index)
+  return hits[hits.length - 1].value
 }
 
 function handleFrame(frame, sessionId, state) {
@@ -113,12 +141,12 @@ function handleFrame(frame, sessionId, state) {
 
   // 附件：官方直接给 token_usage
   if (event === 'update_file') {
-    const tokens = findFirst(json, 'token_usage')
+    const tokens = findField(json, 'token_usage')
     if (typeof tokens === 'number') {
-      const isImage = findFirst(json, 'is_image') === true
+      const isImage = findField(json, 'is_image') === true
       // 同一文件可能先来估算帧、再来精确帧：按 file_id 去重并取最新值
       const fileId =
-        [findFirst(json, 'file_id'), findFirst(json, 'filename'), findFirst(json, 'name')]
+        [findField(json, 'file_id'), findField(json, 'filename'), findField(json, 'name')]
           .find((value) => typeof value === 'string' && value) || null
 
       const existing = fileId ? state.files.find((file) => file.id === fileId) : null
@@ -138,26 +166,30 @@ function handleFrame(frame, sessionId, state) {
     return
   }
 
-  // 主路径：累计用量
-  const usage = findFirst(json, 'accumulated_token_usage')
+  // 主路径：累计用量。兼容直接字段与 {p,v} 补丁两种结构
+  const usage = findField(json, 'accumulated_token_usage')
   // 0 是首轮早期的占位值，不作为有效统计
-  if (typeof usage === 'number' && usage > 0 && state.latest !== usage) {
-    state.latest = usage
+  if (typeof usage === 'number' && usage > 0) {
+    // 自动重连时可能重复下发同一个值：仍标记本轮有真值，但不重复推送
     state.turnHasUsage = true
-    console.log(TAG, '📊 accumulated_token_usage =', usage)
-    postToContent('usage', {
-      sessionId,
-      total: usage
-    })
+    if (state.latest !== usage) {
+      state.latest = usage
+      console.log(TAG, '📊 accumulated_token_usage =', usage)
+      postToContent('usage', {
+        sessionId,
+        total: usage
+      })
+    }
   }
 }
 
-function reportEnd(sessionId, state) {
+function reportEnd(sessionId, state, aborted) {
   console.log(TAG, '🎉 数据流读取完毕', {
     sessionId,
     promptTotal: state.latest,
     postTotal: state.postTotal,
-    attachments: state.files
+    attachments: state.files,
+    aborted: !!aborted
   })
 
   postToContent('stream-end', {
@@ -168,9 +200,15 @@ function reportEnd(sessionId, state) {
 
   if (state.turnHasUsage) {
     state.missCount = 0
-    // 只有本轮真的抓到用量才校准，避免无意义的重复请求
-    setTimeout(() => syncAfterTurn(sessionId), 600)
-  } else if (state.turnHasFrame) {
+    // 自动重连可能让同一轮产生多个 SSE 连接：短时间内只校准一次
+    const now = Date.now()
+    if (now - (state.lastSyncAt || 0) > 1200) {
+      state.lastSyncAt = now
+      setTimeout(() => syncAfterTurn(sessionId), 600)
+    } else {
+      console.log(TAG, '🗂 跳过重复落库校准（同轮重连）')
+    }
+  } else if (state.turnHasFrame && !aborted) {
     // 契约探针：连续多轮有正常帧却解析不到字段，基本可以判定站点改版
     state.missCount = (state.missCount || 0) + 1
     console.warn(TAG, `⚠️ 本轮未解析到 accumulated_token_usage（连续 ${state.missCount} 轮）`)
@@ -183,7 +221,10 @@ function reportEnd(sessionId, state) {
 
 // 生成结束后静默校准：拿到落库后的真实总量（含本轮回复）
 async function syncAfterTurn(sessionId) {
-  const before = getSession(sessionId).postTotal
+  const state = getSession(sessionId)
+  const before = state.postTotal
+  // 请求前先记下“是否像新对话”，避免增量响应只带本轮消息把判断带偏
+  const newBeforeTurn = looksLikeNewConversation(state)
   const hasTemplate =
     !!lastHistoryRequest &&
     !!lastHistoryRequest.url &&
@@ -200,7 +241,8 @@ async function syncAfterTurn(sessionId) {
     result = await requestHistory(url, 4000)
   }
   if (!result) {
-    console.warn(TAG, '🗂 落库校准失败（不影响主流程）')
+    // 预期内的失败，不升级成 warn，避免控制台/扩展错误面板产生噪音
+    console.log(TAG, '🗂 落库校准失败（不影响主流程）')
     return
   }
   if (result.count <= 0) {
@@ -225,12 +267,31 @@ async function syncAfterTurn(sessionId) {
     }
   }
 
-  const state = getSession(sessionId)
   const total = state.postTotal
-  // 只有真正向前增长才算本轮；0 或负数视为尚未落库，不覆盖已有本轮值
-  const roundTokens = before != null && total != null && total > before ? total - before : null
+  // 请求后的消息数：无模板走全量，此时可以直接用它判断是否为新对话
+  const newAfterTurn = looksLikeNewConversation(state)
 
-  console.log(TAG, `🗂 落库校准 total=${total} prev=${before} round=${roundTokens} via=${hasTemplate ? 'incremental' : 'full'}`)
+  let roundTokens = null
+  if (before != null && total != null && total > before) {
+    // 常规轮次：落库总量向前增长，差值即本轮
+    roundTokens = total - before
+  } else if (before == null && total != null && total > 0) {
+    // 首轮（内存里没有上一轮总量）：只有确认是新对话才把总量当本轮，
+    // 否则老对话重载后的首轮会把几十万历史总量算成本轮消耗
+    const newConversation = hasTemplate ? newBeforeTurn : newAfterTurn
+    if (newConversation) {
+      roundTokens = total
+    } else {
+      console.log(TAG, '🗂 首轮疑似历史对话，本轮消耗保持未知')
+    }
+  }
+
+  console.log(
+    TAG,
+    `🗂 落库校准 total=${total} prev=${before} round=${roundTokens} via=${
+      hasTemplate ? 'incremental' : 'full'
+    } newConv=${hasTemplate ? newBeforeTurn : newAfterTurn}`
+  )
 
   postToContent('post-turn', {
     sessionId,
@@ -267,6 +328,12 @@ async function requestHistory(url, timeoutMs) {
 
 /* ---------------- 历史回补 ---------------- */
 
+// 只有全量响应（非 MERGE 增量）才适合做文本估算
+function isFullResponse(source, cacheControl) {
+  if (cacheControl === 'MERGE') return false
+  return source === 'page' || source === 'hard-fetch'
+}
+
 function applyHistory(sessionId, text, source) {
   if (!sessionId || sessionId === 'unknown') {
     console.warn(TAG, '🗂 历史响应缺少有效会话 ID，已丢弃')
@@ -280,6 +347,8 @@ function applyHistory(sessionId, text, source) {
   }
 
   const { arr: messages } = findMessageArray(json)
+  const cacheControl = findFirst(json, 'cache_control')
+  const state = getSession(sessionId)
 
   // 会话可能有多条分支消息，只有 current_message_id 指向的才是当前主线
   const currentMessageId = findFirst(json, 'current_message_id')
@@ -306,10 +375,15 @@ function applyHistory(sessionId, text, source) {
 
     if (baseline != null) {
       baselineSource = 'message-field'
-    } else {
-      // 所有消息都没有该字段时才做文本估算
-      baseline = messages.reduce((sum, msg) => sum + estimateTokens(extractText(msg)), 0)
-      baselineSource = baseline > 0 ? 'estimate' : 'unknown'
+    } else if (isFullResponse(source, cacheControl)) {
+      // 只有全量响应才允许文本估算：增量包数据不全，估出来必然是错的
+      const estimated = messages.reduce((sum, msg) => sum + estimateTokens(extractText(msg)), 0)
+      // 估算值不得低于已有总量，避免小残片覆盖真实值
+      const monotonic = state.postTotal == null || estimated >= state.postTotal
+      if (estimated > 0 && monotonic) {
+        baseline = estimated
+        baselineSource = 'estimate'
+      }
     }
   }
 
@@ -319,14 +393,19 @@ function applyHistory(sessionId, text, source) {
     baselineSource = 'unknown'
   }
 
-  const state = getSession(sessionId)
   currentSessionId = sessionId
-  state.postTotal = baseline
+  // baseline 为 null 时不动已有总量，避免无有效数据时把总量清空
+  if (baseline != null) state.postTotal = baseline
   if (baseline != null && state.latest === null) state.latest = baseline
 
   const ok = baseline != null || (messages && messages.length > 0)
   const title = findFirst(json, 'title')
-  const cacheControl = findFirst(json, 'cache_control')
+
+  // 记录会话事实，供后续判断“老对话”还是“新对话”，避免再次误判
+  state.historyCount = messages ? messages.length : 0
+  state.historyCtrl = typeof cacheControl === 'string' ? cacheControl : null
+  state.currentMessageId = currentMessageId != null ? currentMessageId : null
+  if (typeof title === 'string' && title) state.historyTitle = title
 
   console.log(
     TAG,
@@ -440,6 +519,14 @@ async function hardRefreshHistory(sessionId, hasCache) {
 
   const headers = buildAuthHeaders()
 
+  // 先按已有会话事实判断：确认是空对话时直接收尾，不再发请求
+  const verdict = classifyHistory(target, hasCache)
+  if (verdict === 'empty') {
+    console.log(TAG, '🗂 会话事实判定为空对话，快速截断')
+    postToContent('sync-status', { sessionId: target, status: 'empty' })
+    return
+  }
+
   // 1) 增量探测：只有上一次历史请求属于同一会话时才能复用它的 cache_version
   const lastUrlSession = lastHistoryRequest && lastHistoryRequest.url
     ? getSessionIdFromUrl(lastHistoryRequest.url)
@@ -470,12 +557,11 @@ async function hardRefreshHistory(sessionId, hasCache) {
           postToContent('sync-status', { sessionId: target, status: 'up-to-date' })
           return
         }
-        // 无缓存且增量无变化：新对话，直接收尾，不再触发全量
-        if (count === 0) {
-          console.log(TAG, '🗂 新对话无历史数据，快速截断')
-          postToContent('sync-status', { sessionId: target, status: 'empty' })
-          return
-        }
+        // 无缓存又遇到 MERGE：不能判定为新对话，继续走全量兜底，
+        // 否则刚清过缓存的老会话会被误报为“暂无历史数据”
+        state.historyCtrl = 'MERGE'
+        state.historyCount = count
+        console.log(TAG, '🗂 无缓存但增量为空，转全量确认')
       }
     } catch (err) {
       console.warn(TAG, '🗂 增量探测异常，转全量', err)
@@ -483,11 +569,27 @@ async function hardRefreshHistory(sessionId, hasCache) {
   }
 
   // 2) 全量兜底：只在无缓存或增量失败时执行
+  const finalVerdict = classifyHistory(target, hasCache)
+  if (finalVerdict === 'empty') {
+    console.log(TAG, '🗂 增量探测后仍判定为空对话，快速截断')
+    postToContent('sync-status', { sessionId: target, status: 'empty' })
+    return
+  }
+
   const url = buildHistoryUrl(target)
   console.log(TAG, '🗂 主动拉取全量历史', { url, hasAuth: !!headers.Authorization })
 
+  // 空对话的服务端会挂起请求，必须自带超时，不能依赖前端 30 秒兜底
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), 8000) : null
+
   try {
-    const res = await origFetch(url, { method: 'GET', headers, credentials: 'include' })
+    const res = await origFetch(url, {
+      method: 'GET',
+      headers,
+      credentials: 'include',
+      signal: controller ? controller.signal : undefined
+    })
     const text = await res.text()
     console.log(
       TAG,
@@ -514,15 +616,72 @@ async function hardRefreshHistory(sessionId, hasCache) {
       if (!fallback) reportRefreshFailed(target)
     }
   } catch (err) {
+    if (err && err.name === 'AbortError') {
+      // 超时后不再复放，否则会第二次挂起；超时属于“未能确认”，不当作请求失败
+      console.warn(TAG, '🗂 全量拉取超时（8s），终止本次校准')
+      postToContent('sync-status', { sessionId: target, status: 'timeout' })
+      return
+    }
     console.warn(TAG, '🗂 主动拉取异常，回退到请求头复放', err)
     const fallback = await refreshHistory(target)
     if (!fallback) reportRefreshFailed(target)
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
 // 两条兜底路径都失败时也要让前端收尾，避免转圈干等 30 秒超时
 function reportRefreshFailed(sessionId) {
   postToContent('sync-status', { sessionId, status: 'failed' })
+}
+
+// 首轮判定阈值：新对话第一轮一问一答通常不超过 4 条消息
+const NEW_CONVERSATION_MAX_MESSAGES = 4
+const PLACEHOLDER_TITLE_RE = /^(新对话|新的对话|未命名对话|未命名|new chat|new conversation|untitled)$/i
+
+function hasMeaningfulTitle(state) {
+  const title = typeof state.historyTitle === 'string' ? state.historyTitle.trim() : ''
+  return title.length > 0 && !PLACEHOLDER_TITLE_RE.test(title)
+}
+
+// 依据会话事实判断是否“像新对话”：无主线、无有效标题、非 MERGE，且消息数很少
+function looksLikeNewConversation(state) {
+  return (
+    state.currentMessageId == null &&
+    !hasMeaningfulTitle(state) &&
+    state.historyCtrl !== 'MERGE' &&
+    state.historyCount != null &&
+    state.historyCount <= NEW_CONVERSATION_MAX_MESSAGES
+  )
+}
+
+// 基于会话事实判断历史是否存在：history（有内容） / empty（确认新对话） / unknown（无法判定）
+function classifyHistory(sessionId, hasCache) {
+  const state = getSession(sessionId)
+  // 占位标题不算证据，避免新对话被误判成老对话
+  const meaningfulTitle = hasMeaningfulTitle(state)
+
+  // 正向证据：服务端有主线/消息，或 MERGE（说明服务端持有快照），或本地/内存已有数据
+  const positive =
+    (state.historyCount != null && state.historyCount > 0) ||
+    state.currentMessageId != null ||
+    meaningfulTitle ||
+    state.historyCtrl === 'MERGE' ||
+    state.hasCompletion ||
+    hasCache ||
+    state.latest != null ||
+    state.postTotal != null
+
+  if (positive) return 'history'
+
+  // 负向证据：已看到明确的空历史响应（非 MERGE、无主线），且从未发过消息
+  const negative =
+    state.historyCount === 0 &&
+    state.historyCtrl !== 'MERGE' &&
+    state.currentMessageId == null &&
+    !state.hasCompletion
+
+  return negative ? 'empty' : 'unknown'
 }
 
 // 一次性探针：判断 history_messages 是否支持 limit 类参数
@@ -711,7 +870,7 @@ window.fetch = async function (input, init) {
 
   try {
     const url = typeof input === 'string' ? input : input && input.url
-    if (DEBUG && url && url.includes('/api/')) {
+    if (DEBUG && url && (url.includes(COMPLETION_PATH) || url.includes(HISTORY_PATH))) {
       console.log(TAG, '🔍 fetch:', url)
     }
     if (!url) return response
@@ -742,6 +901,7 @@ window.fetch = async function (input, init) {
     }
     console.log(TAG, '🎯 拦截到 completion（fetch）', { sessionId, url })
     currentSessionId = sessionId
+    getSession(sessionId).hasCompletion = true
 
     // clone() 拿到第二份流，页面继续消费原响应，互不影响
     const parser = createSseParser(sessionId)
@@ -834,6 +994,8 @@ async function parseStream(stream, parser) {
     }
   } catch (err) {
     console.warn(TAG, 'SSE 解析中断（用户停止或网络抖动），仍尝试收尾', err)
+    // 中断不参与契约告警计数，避免把自动重连抖动误判为站点改版
+    if (typeof parser.abort === 'function') parser.abort()
   } finally {
     // 必须收尾：否则本轮不结束、下一轮的本轮值会虚高
     try {
@@ -873,7 +1035,7 @@ XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
 XMLHttpRequest.prototype.send = function (body) {
   try {
     const url = this.__deepbrimUrl || ''
-    if (DEBUG && url.includes('/api/')) {
+    if (DEBUG && (url.includes(COMPLETION_PATH) || url.includes(HISTORY_PATH))) {
       console.log(TAG, '🔍 xhr:', url)
     }
 
@@ -899,6 +1061,7 @@ function attachCompletionParser(xhr, url, body) {
   }
 
   currentSessionId = sessionId
+  getSession(sessionId).hasCompletion = true
   console.log(TAG, '🎯 拦截到 completion（xhr）', { sessionId, url })
 
   const parser = createSseParser(sessionId)
@@ -917,6 +1080,10 @@ function attachCompletionParser(xhr, url, body) {
       console.warn(TAG, '读取 XHR responseText 失败', err)
     }
   })
+
+  // 用户停止生成或网络中断：标记为中断，不参与契约告警计数
+  xhr.addEventListener('error', () => parser.abort())
+  xhr.addEventListener('abort', () => parser.abort())
 
   xhr.addEventListener('loadend', () => {
     try {
@@ -1022,6 +1189,31 @@ function findFirst(node, key, depth = 0) {
     if (hit !== undefined) return hit
   }
   return undefined
+}
+
+// 递归识别 SSE 补丁结构 {p:'字段名', v:值}，兼容字段路径式增量下发
+// 同一帧内出现多个同名字段时保留最后一个
+function findPatchValue(node, pathName) {
+  let result
+
+  const walk = (current, depth) => {
+    if (!current || typeof current !== 'object' || depth > 8) return
+
+    if (!Array.isArray(current) && current.p === pathName) result = current.v
+
+    const values = Array.isArray(current) ? current : Object.values(current)
+    for (const value of values) walk(value, depth + 1)
+  }
+
+  walk(node, 0)
+  return result
+}
+
+// 先按 key 查找，再按补丁 p/v 查找，两种下发格式都兼容
+function findField(node, key) {
+  const direct = findFirst(node, key)
+  if (direct !== undefined) return direct
+  return findPatchValue(node, key)
 }
 
 function postToContent(type, payload) {

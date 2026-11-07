@@ -1027,6 +1027,12 @@ function calibrateCache() {
 }
 
 function requestHardRefresh() {
+  // 物理防连点：请求进行中不再重复发起
+  if (pendingHardRefresh) {
+    showToast('正在同步历史，请稍候…')
+    return
+  }
+
   if (!state.sessionId) {
     showToast('暂无会话数据')
     return
@@ -1173,12 +1179,14 @@ function handleData(msg) {
   }
 
   if (type === 'sync-status') {
-    if (payload.status === 'failed') {
+    if (payload.status === 'failed' || payload.status === 'timeout') {
       if (pendingHardRefresh) {
         pendingHardRefresh = false
         clearTimeout(pendingTimer)
         stopSpin()
-        showToast('历史拉取失败，已保留缓存')
+        showToast(
+          payload.status === 'timeout' ? '无法确认历史，请稍后重试' : '历史拉取失败，已保留缓存'
+        )
       }
       return
     }
