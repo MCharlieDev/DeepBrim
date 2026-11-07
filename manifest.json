@@ -1,8 +1,12 @@
 {
   "manifest_version": 3,
   "name": "DeepBrim",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "DeepSeek 网页版上下文仪表盘：看清每次对话的 Token 用量。",
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
   "permissions": ["storage"],
   "content_scripts": [
     {

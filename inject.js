@@ -6,7 +6,9 @@ const COMPLETION_PATH = '/chat/completion'
 const HISTORY_PATH = '/chat/history_messages'
 // 连请求模板都还没捕获到时的最后兜底路径（匹配用 HISTORY_PATH，发请求用这个）
 const HISTORY_FALLBACK_PATH = '/api/v0/chat/history_messages'
-const DEBUG = true
+const DEBUG_DEFAULT = false
+// 由设置页通过 postMessage 动态控制，默认静默
+let DEBUG = DEBUG_DEFAULT
 const RAW_TAIL_LIMIT = 64 * 1024
 
 // 历史消息里可能承载正文的字段，估计时只走这些 key，避免把 id / 时间戳算进去
@@ -30,6 +32,11 @@ let contractWarned = false
 const MAX_SESSIONS = 200
 const MAX_FILES = 200
 
+// 底层正常路径日志统一出口：默认关闭，只有调试开关打开时才输出
+function dbg(...args) {
+  if (DEBUG) console.log(TAG, ...args)
+}
+
 function getSession(sessionId) {
   if (!sessions.has(sessionId)) {
     // 上限保护：会话状态只增不减会在长时间 SPA 使用中累积
@@ -50,7 +57,12 @@ function getSession(sessionId) {
       currentMessageId: null,
       historyTitle: null,
       // 同轮重连去重：记录最近一次触发落库校准的时间
-      lastSyncAt: 0
+      lastSyncAt: 0,
+      // 页面自身的被动历史请求：用于宽限期等待与主动请求收敛
+      passiveInFlight: 0,
+      passiveResolvedAt: 0,
+      activeHistory: null,
+      superseded: false
     })
   }
   return sessions.get(sessionId)
@@ -97,7 +109,7 @@ function createSseParser(sessionId) {
         if (last !== null) {
           state.latest = last
           state.turnHasUsage = true
-          console.log(TAG, '📊 兜底抓到 accumulated_token_usage =', last)
+          dbg('📊 兜底抓到 accumulated_token_usage =', last)
         }
       }
       reportEnd(sessionId, state, aborted)
@@ -160,7 +172,7 @@ function handleFrame(frame, sessionId, state) {
       }
 
       const total = state.files.reduce((sum, file) => sum + (file.tokens || 0), 0)
-      console.log(TAG, '📎 附件用量', { tokens, isImage, total })
+      dbg('📎 附件用量', { tokens, isImage, total })
       postToContent('file-usage', { sessionId, tokens, isImage, total })
     }
     return
@@ -174,7 +186,7 @@ function handleFrame(frame, sessionId, state) {
     state.turnHasUsage = true
     if (state.latest !== usage) {
       state.latest = usage
-      console.log(TAG, '📊 accumulated_token_usage =', usage)
+      dbg('📊 accumulated_token_usage =', usage)
       postToContent('usage', {
         sessionId,
         total: usage
@@ -184,7 +196,7 @@ function handleFrame(frame, sessionId, state) {
 }
 
 function reportEnd(sessionId, state, aborted) {
-  console.log(TAG, '🎉 数据流读取完毕', {
+  dbg('🎉 数据流读取完毕', {
     sessionId,
     promptTotal: state.latest,
     postTotal: state.postTotal,
@@ -206,12 +218,12 @@ function reportEnd(sessionId, state, aborted) {
       state.lastSyncAt = now
       setTimeout(() => syncAfterTurn(sessionId), 600)
     } else {
-      console.log(TAG, '🗂 跳过重复落库校准（同轮重连）')
+      dbg('🗂 跳过重复落库校准（同轮重连）')
     }
   } else if (state.turnHasFrame && !aborted) {
     // 契约探针：连续多轮有正常帧却解析不到字段，基本可以判定站点改版
     state.missCount = (state.missCount || 0) + 1
-    console.warn(TAG, `⚠️ 本轮未解析到 accumulated_token_usage（连续 ${state.missCount} 轮）`)
+    dbg(`⚠️ 本轮未解析到 accumulated_token_usage（连续 ${state.missCount} 轮）`)
     if (state.missCount >= 3 && !contractWarned) {
       contractWarned = true
       postToContent('contract-warning', { sessionId })
@@ -233,20 +245,25 @@ async function syncAfterTurn(sessionId) {
   // 新对话没有可复用的历史请求模板，改用一次全量请求（此时消息很少，成本低）
   const url = hasTemplate ? replaceParam(lastHistoryRequest.url, 'chat_session_id', sessionId) : buildHistoryUrl(sessionId)
 
-  let result = await requestHistory(url, hasTemplate ? 8000 : 4000)
-  // 新对话可能尚未落库：退避 1.2 秒再试一次
-  if (!hasTemplate && (!result || result.count <= 0)) {
-    console.log(TAG, '🗂 落库校准：首轮为空，1.2s 后重试')
+  // 增量与全量使用不同的三段式超时档位
+  const incrementalTimeouts = { headerTimeout: 4000, idleTimeout: 8000, totalTimeout: 15000 }
+  const fullTimeouts = { headerTimeout: 5000, idleTimeout: 12000, totalTimeout: 20000 }
+
+  let result = await requestHistory(url, hasTemplate ? incrementalTimeouts : fullTimeouts)
+  // 新对话可能尚未落库，或增量暂时为空：退避 1.2 秒再试一次全量
+  const emptyResult = (res) => !res || res.aborted || res.count <= 0
+  if (!hasTemplate && emptyResult(result)) {
+    dbg('🗂 落库校准：首轮为空，1.2s 后重试')
     await new Promise((resolve) => setTimeout(resolve, 1200))
-    result = await requestHistory(url, 4000)
+    result = await requestHistory(url, fullTimeouts)
   }
-  if (!result) {
+  if (!result || result.aborted) {
     // 预期内的失败，不升级成 warn，避免控制台/扩展错误面板产生噪音
-    console.log(TAG, '🗂 落库校准失败（不影响主流程）')
+    dbg('🗂 落库校准失败（不影响主流程）')
     return
   }
   if (result.count <= 0) {
-    console.log(TAG, '🗂 落库校准：没有新消息，跳过')
+    dbg('🗂 落库校准：没有新消息，跳过')
     return
   }
 
@@ -263,7 +280,7 @@ async function syncAfterTurn(sessionId) {
         url: buildIncrementalUrl(baseUrl, sessionId, cacheVersion, findFirst(result.json, 'cache_reset_at')),
         headers: result.headers || {}
       }
-      console.log(TAG, `🗂 已沉淀增量模板 cache_version=${cacheVersion}`)
+      dbg(`🗂 已沉淀增量模板 cache_version=${cacheVersion}`)
     }
   }
 
@@ -282,12 +299,11 @@ async function syncAfterTurn(sessionId) {
     if (newConversation) {
       roundTokens = total
     } else {
-      console.log(TAG, '🗂 首轮疑似历史对话，本轮消耗保持未知')
+      dbg('🗂 首轮疑似历史对话，本轮消耗保持未知')
     }
   }
 
-  console.log(
-    TAG,
+  dbg(
     `🗂 落库校准 total=${total} prev=${before} round=${roundTokens} via=${
       hasTemplate ? 'incremental' : 'full'
     } newConv=${hasTemplate ? newBeforeTurn : newAfterTurn}`
@@ -301,29 +317,114 @@ async function syncAfterTurn(sessionId) {
   })
 }
 
-async function requestHistory(url, timeoutMs) {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
-  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+// 历史请求三段式超时：等响应头（TTFB）、收包空闲、总耗时上限
+// 固定墙钟无法同时覆盖“服务端挂起”和“大包弱网慢下载”，必须分阶段判定
+function requestHistory(url, options = {}) {
+  const opts =
+    typeof options === 'number'
+      ? { headerTimeout: options, idleTimeout: options, totalTimeout: options }
+      : options
 
-  try {
-    const headers = buildAuthHeaders()
-    const res = await origFetch(url, {
-      method: 'GET',
-      headers,
-      credentials: 'include',
-      signal: controller ? controller.signal : undefined
-    })
-    if (!res.ok) return null
+  const headerTimeout = opts.headerTimeout != null ? opts.headerTimeout : 6000
+  const idleTimeout = opts.idleTimeout != null ? opts.idleTimeout : 10000
+  const totalTimeout = opts.totalTimeout != null ? opts.totalTimeout : 20000
+  const controller =
+    opts.controller || (typeof AbortController !== 'undefined' ? new AbortController() : null)
 
-    const text = await res.text()
-    const json = safeParse(text)
-    const count = json ? (findMessageArray(json).arr || []).length : 0
-    return { text, json, count, url: res.url || url, headers }
-  } catch {
-    return null
-  } finally {
-    if (timer) clearTimeout(timer)
+  let headerTimer = null
+  let idleTimer = null
+  let totalTimer = null
+  let abortReason = null
+
+  const clearTimers = () => {
+    clearTimeout(headerTimer)
+    clearTimeout(idleTimer)
+    clearTimeout(totalTimer)
+    headerTimer = null
+    idleTimer = null
+    totalTimer = null
   }
+
+  const abortWith = (reason) => {
+    if (abortReason) return
+    abortReason = reason
+    try {
+      if (controller) controller.abort()
+    } catch {
+      // 已结束
+    }
+  }
+
+  const armIdle = () => {
+    clearTimeout(idleTimer)
+    if (controller) idleTimer = setTimeout(() => abortWith('idle'), idleTimeout)
+  }
+
+  return (async () => {
+    try {
+      const headers = buildAuthHeaders()
+
+      if (controller) {
+        headerTimer = setTimeout(() => abortWith('header'), headerTimeout)
+        totalTimer = setTimeout(() => abortWith('total'), totalTimeout)
+      }
+
+      const res = await origFetch(url, {
+        method: 'GET',
+        headers,
+        credentials: 'include',
+        signal: controller ? controller.signal : undefined
+      })
+
+      // 响应头已到达：结束 TTFB 阶段，进入收包阶段
+      clearTimeout(headerTimer)
+      headerTimer = null
+      if (!res.ok) {
+        clearTimers()
+        return null
+      }
+
+      let text = ''
+      if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader()
+        const decoder = new TextDecoder('utf-8')
+        armIdle()
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          // 每收到一块就重置空闲计时，慢但持续的下载不会被误杀
+          armIdle()
+          text += decoder.decode(value, { stream: true })
+        }
+        text += decoder.decode()
+      } else {
+        text = await res.text()
+      }
+
+      clearTimers()
+      const json = safeParse(text)
+      const count = json ? (findMessageArray(json).arr || []).length : 0
+      return {
+        text,
+        json,
+        count,
+        url: res.url || url,
+        headers,
+        status: res.status,
+        contentType: res.headers.get('content-type') || '',
+        aborted: false
+      }
+    } catch {
+      if (abortReason) {
+        dbg(`🗂 历史请求中止（${abortReason}）`)
+        return { aborted: true, reason: abortReason }
+      }
+      return null
+    } finally {
+      clearTimers()
+    }
+  })()
 }
 
 /* ---------------- 历史回补 ---------------- */
@@ -336,13 +437,13 @@ function isFullResponse(source, cacheControl) {
 
 function applyHistory(sessionId, text, source) {
   if (!sessionId || sessionId === 'unknown') {
-    console.warn(TAG, '🗂 历史响应缺少有效会话 ID，已丢弃')
+    dbg('🗂 历史响应缺少有效会话 ID，已丢弃')
     return false
   }
 
   const json = safeParse(text)
   if (!json) {
-    console.warn(TAG, '🗂 历史响应不是 JSON，无法回补')
+    dbg('🗂 历史响应不是 JSON，无法回补')
     return
   }
 
@@ -407,8 +508,7 @@ function applyHistory(sessionId, text, source) {
   state.currentMessageId = currentMessageId != null ? currentMessageId : null
   if (typeof title === 'string' && title) state.historyTitle = title
 
-  console.log(
-    TAG,
+  dbg(
     `🗂 回补结果 source=${source} code=${json.code} msg=${json.msg || ''} count=${
       messages ? messages.length : 0
     } baseline=${baseline} from=${baselineSource} ctrl=${cacheControl || ''} currentMsg=${
@@ -482,7 +582,7 @@ function estimateTokens(text) {
 
 async function refreshHistory(sessionId) {
   if (!lastHistoryRequest) {
-    console.warn(TAG, '🗂 还没有捕获到 history_messages 请求，无法重拉')
+    dbg('🗂 还没有捕获到 history_messages 请求，无法重拉')
     return null
   }
 
@@ -492,7 +592,7 @@ async function refreshHistory(sessionId) {
   const headers = filterReplayHeaders(lastHistoryRequest.headers)
   const target = sessionId || getSessionIdFromUrl(url)
 
-  console.log(TAG, '🗂 手动重拉历史', { url, target })
+  dbg('🗂 手动重拉历史', { url, target })
 
   try {
     const res = await origFetch(url, { headers, credentials: 'include' })
@@ -500,8 +600,18 @@ async function refreshHistory(sessionId) {
     applyHistory(target, text, 'manual')
     return target
   } catch (err) {
-    console.warn(TAG, '🗂 重拉历史失败', err)
+    dbg('🗂 重拉历史失败', err)
     return null
+  }
+}
+
+// 历史回补的异常兜底：解析失败不应让主动拉取整体 reject
+function safeApplyHistory(sessionId, text, source) {
+  try {
+    return applyHistory(sessionId, text, source)
+  } catch (err) {
+    dbg('🗂 历史回补解析异常', err)
+    return false
   }
 }
 
@@ -512,19 +622,34 @@ async function hardRefreshHistory(sessionId, hasCache) {
     currentSessionId ||
     getSessionIdFromUrl((lastHistoryRequest && lastHistoryRequest.url) || '')
   if (!target || target === 'unknown') {
-    console.warn(TAG, '🗂 没有可用的会话 ID，无法主动拉取')
+    dbg('🗂 没有可用的会话 ID，无法主动拉取')
     postToContent('sync-status', { sessionId: sessionId || null, status: 'no-session' })
     return
   }
 
   const headers = buildAuthHeaders()
+  const state = getSession(target)
+  state.superseded = false
 
   // 先按已有会话事实判断：确认是空对话时直接收尾，不再发请求
-  const verdict = classifyHistory(target, hasCache)
+  let verdict = classifyHistory(target, hasCache)
   if (verdict === 'empty') {
-    console.log(TAG, '🗂 会话事实判定为空对话，快速截断')
+    dbg('🗂 会话事实判定为空对话，快速截断')
     postToContent('sync-status', { sessionId: target, status: 'empty' })
     return
+  }
+
+  // 事实不足且页面自身的请求还在进行：给它一个短宽限期，能省掉一次全量下载
+  if (verdict === 'unknown' && state.passiveInFlight > 0) {
+    dbg('🗂 会话事实不足，等待页面自身历史请求')
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    const next = classifyHistory(target, hasCache)
+    if (next === 'empty') {
+      dbg('🗂 宽限期内确认空对话，快速截断')
+      postToContent('sync-status', { sessionId: target, status: 'empty' })
+      return
+    }
+    verdict = next
   }
 
   // 1) 增量探测：只有上一次历史请求属于同一会话时才能复用它的 cache_version
@@ -535,25 +660,29 @@ async function hardRefreshHistory(sessionId, hasCache) {
 
   if (canIncremental && lastHistoryRequest && lastHistoryRequest.url) {
     const incUrl = replaceParam(lastHistoryRequest.url, 'chat_session_id', target)
-    try {
-      const res = await origFetch(incUrl, { method: 'GET', headers, credentials: 'include' })
-      const text = await res.text()
-      const json = safeParse(text)
-      const arr = json ? findMessageArray(json).arr : null
-      const count = arr ? arr.length : 0
-      const ctrl = json ? findFirst(json, 'cache_control') : ''
+    const incResult = await requestHistory(incUrl, {
+      headerTimeout: 4000,
+      idleTimeout: 8000,
+      totalTimeout: 12000
+    })
 
-      console.log(TAG, `🗂 增量探测 status=${res.status} count=${count} ctrl=${ctrl || ''} len=${text.length}`)
+    if (incResult && !incResult.aborted) {
+      const count = incResult.count
+      const ctrl = incResult.json ? findFirst(incResult.json, 'cache_control') : ''
+      dbg(
+        `🗂 增量探测 status=${incResult.status} count=${count} ctrl=${ctrl || ''} len=${
+          incResult.text.length
+        }`
+      )
 
-      if (res.ok && count > 0) {
-        applyHistory(target, text, 'incremental')
+      if (count > 0) {
+        safeApplyHistory(target, incResult.text, 'incremental')
         return
       }
 
-      if (res.ok && ctrl === 'MERGE') {
-        const state = getSession(target)
+      if (ctrl === 'MERGE') {
         if (hasCache || state.latest != null || state.postTotal != null) {
-          console.log(TAG, '🗂 增量无变化，缓存已是最新')
+          dbg('🗂 增量无变化，缓存已是最新')
           postToContent('sync-status', { sessionId: target, status: 'up-to-date' })
           return
         }
@@ -561,72 +690,109 @@ async function hardRefreshHistory(sessionId, hasCache) {
         // 否则刚清过缓存的老会话会被误报为“暂无历史数据”
         state.historyCtrl = 'MERGE'
         state.historyCount = count
-        console.log(TAG, '🗂 无缓存但增量为空，转全量确认')
+        dbg('🗂 无缓存但增量为空，转全量确认')
       }
-    } catch (err) {
-      console.warn(TAG, '🗂 增量探测异常，转全量', err)
+    } else if (incResult && incResult.aborted) {
+      dbg(`🗂 增量探测中止（${incResult.reason}），转全量`)
     }
   }
 
   // 2) 全量兜底：只在无缓存或增量失败时执行
   const finalVerdict = classifyHistory(target, hasCache)
   if (finalVerdict === 'empty') {
-    console.log(TAG, '🗂 增量探测后仍判定为空对话，快速截断')
+    dbg('🗂 增量探测后仍判定为空对话，快速截断')
     postToContent('sync-status', { sessionId: target, status: 'empty' })
     return
   }
 
   const url = buildHistoryUrl(target)
-  console.log(TAG, '🗂 主动拉取全量历史', { url, hasAuth: !!headers.Authorization })
+  dbg('🗂 主动拉取全量历史', { url, hasAuth: !!headers.Authorization })
 
-  // 空对话的服务端会挂起请求，必须自带超时，不能依赖前端 30 秒兜底
+  // 按会话事实选择超时档位：老对话大包给更长预算，避免弱网误杀
+  const timeouts = historyTimeoutsFor(finalVerdict, state)
   const controller = typeof AbortController !== 'undefined' ? new AbortController() : null
-  const timer = controller ? setTimeout(() => controller.abort(), 8000) : null
+  state.activeHistory = controller ? { controller, startedAt: Date.now() } : null
 
-  try {
-    const res = await origFetch(url, {
-      method: 'GET',
-      headers,
-      credentials: 'include',
-      signal: controller ? controller.signal : undefined
-    })
-    const text = await res.text()
-    console.log(
-      TAG,
-      `🗂 主动拉取响应 status=${res.status} type=${res.headers.get('content-type')} len=${text.length}`
-    )
+  const result = await requestHistory(url, { ...timeouts, controller })
 
-    if (!res.ok) {
-      console.warn(TAG, '🗂 主动拉取失败，回退到请求头复放')
-      const fallback = await refreshHistory(target)
-      if (!fallback) reportRefreshFailed(target)
-      return
-    }
+  state.activeHistory = null
 
-    const messages = findMessageArray(safeParse(text)).arr
-    const ok = applyHistory(target, text, 'hard-fetch')
-    if (!ok) {
-      if (!messages || messages.length === 0) {
-        console.warn(TAG, '🗂 该会话暂无历史消息，快速截断')
-        postToContent('sync-status', { sessionId: target, status: 'empty' })
-        return
-      }
-      console.warn(TAG, '🗂 主动拉取没拿到有效数据，回退到请求头复放')
-      const fallback = await refreshHistory(target)
-      if (!fallback) reportRefreshFailed(target)
-    }
-  } catch (err) {
-    if (err && err.name === 'AbortError') {
-      // 超时后不再复放，否则会第二次挂起；超时属于“未能确认”，不当作请求失败
-      console.warn(TAG, '🗂 全量拉取超时（8s），终止本次校准')
-      postToContent('sync-status', { sessionId: target, status: 'timeout' })
-      return
-    }
-    console.warn(TAG, '🗂 主动拉取异常，回退到请求头复放', err)
+  // 被动请求已经先行拿到数据，主动请求无论成功、失败还是被取消都不再收尾
+  if (state.superseded) {
+    dbg('🗂 页面自身历史已先行完成，放弃主动拉取')
+    return
+  }
+
+  if (!result) {
+    dbg('🗂 主动拉取失败，回退到请求头复放')
     const fallback = await refreshHistory(target)
     if (!fallback) reportRefreshFailed(target)
-  } finally {
-    if (timer) clearTimeout(timer)
+    return
+  }
+
+  if (result.aborted) {
+    dbg(`🗂 全量拉取中止（${result.reason}），终止本次校准`)
+    postToContent('sync-status', { sessionId: target, status: 'timeout' })
+    return
+  }
+
+  dbg(
+    `🗂 主动拉取响应 status=${result.status} type=${result.contentType} len=${result.text.length}`
+  )
+
+  const messages = result.json ? findMessageArray(result.json).arr : null
+  const ok = safeApplyHistory(target, result.text, 'hard-fetch')
+  if (!ok) {
+    if (!messages || messages.length === 0) {
+      dbg('🗂 该会话暂无历史消息，快速截断')
+      postToContent('sync-status', { sessionId: target, status: 'empty' })
+      return
+    }
+    dbg('🗂 主动拉取没拿到有效数据，回退到请求头复放')
+    const fallback = await refreshHistory(target)
+    if (!fallback) reportRefreshFailed(target)
+  }
+}
+
+// 全量请求超时档位：消息越多，包越大，给越长的 TTFB / 空闲 / 总耗时预算
+function historyTimeoutsFor(verdict, state) {
+  const count = state.historyCount
+  if (verdict === 'history' && count != null && count > 50) {
+    return { headerTimeout: 8000, idleTimeout: 15000, totalTimeout: 25000 }
+  }
+  if (verdict === 'history') {
+    return { headerTimeout: 6000, idleTimeout: 10000, totalTimeout: 20000 }
+  }
+  return { headerTimeout: 4000, idleTimeout: 8000, totalTimeout: 15000 }
+}
+
+// 页面自身的被动历史请求：开始/结束计数，成功时通知主动请求收敛
+function passiveHistoryStart(sessionId) {
+  if (!sessionId || sessionId === 'unknown') return null
+  const state = getSession(sessionId)
+  state.passiveInFlight = (state.passiveInFlight || 0) + 1
+  return state
+}
+
+function passiveHistoryEnd(state) {
+  if (!state) return
+  state.passiveInFlight = Math.max(0, (state.passiveInFlight || 0) - 1)
+}
+
+function notifyPassiveResolved(sessionId) {
+  if (!sessionId || sessionId === 'unknown') return
+  const state = getSession(sessionId)
+  state.passiveResolvedAt = Date.now()
+
+  // 主动全量还在跑：直接放弃，省掉一次重复的大包下载
+  if (state.activeHistory && state.activeHistory.controller) {
+    state.superseded = true
+    try {
+      state.activeHistory.controller.abort()
+    } catch {
+      // 已结束
+    }
+    dbg('🗂 被动历史已返回，取消进行中的主动拉取')
   }
 }
 
@@ -692,7 +858,7 @@ async function probeLimit(sessionId) {
     currentSessionId ||
     getSessionIdFromUrl((lastHistoryRequest && lastHistoryRequest.url) || '')
   if (!target || target === 'unknown') {
-    console.warn(TAG, '🔬 没有可用的会话 ID')
+    dbg('🔬 没有可用的会话 ID')
     return
   }
 
@@ -739,16 +905,14 @@ async function probeLimit(sessionId) {
       const ctrl = json ? findFirst(json, 'cache_control') : ''
       const lastUsage = arr && arr.length ? findFirst(arr[arr.length - 1], 'accumulated_token_usage') : undefined
 
-      console.log(
-        TAG,
+      dbg(
         `🔬 probe "${variant.label}" status=${res.status} ms=${Math.round(
           performance.now() - started
         )} len=${text.length} count=${count} ctrl=${ctrl || ''} lastUsage=${lastUsage}`
       )
     } catch (err) {
       clearTimeout(timer)
-      console.log(
-        TAG,
+      dbg(
         `🔬 probe "${variant.label}" ${err && err.name === 'AbortError' ? '超时中止' : '异常'} after ${Math.round(
           performance.now() - started
         )}ms`
@@ -756,7 +920,7 @@ async function probeLimit(sessionId) {
     }
   }
 
-  console.log(TAG, '🔬 probe 结束：若某个参数 len/ms 明显小于 control 且 count≈10，说明该参数生效')
+  dbg('🔬 probe 结束：若某个参数 len/ms 明显小于 control 且 count≈10，说明该参数生效')
 }
 
 function buildHistoryUrl(sessionId) {
@@ -871,7 +1035,7 @@ window.fetch = async function (input, init) {
   try {
     const url = typeof input === 'string' ? input : input && input.url
     if (DEBUG && url && (url.includes(COMPLETION_PATH) || url.includes(HISTORY_PATH))) {
-      console.log(TAG, '🔍 fetch:', url)
+      dbg('🔍 fetch:', url)
     }
     if (!url) return response
 
@@ -890,16 +1054,16 @@ window.fetch = async function (input, init) {
 
     const contentType = response.headers.get('content-type') || ''
     if (!contentType.includes('text/event-stream') || !response.body) {
-      console.log(TAG, '命中 completion(fetch) 但响应不是 SSE，已跳过', url)
+      dbg('命中 completion(fetch) 但响应不是 SSE，已跳过', url)
       return response
     }
 
     const sessionId = parseSessionId(await readRequestBody(input, init))
     if (!sessionId) {
-      console.warn(TAG, '🎯 completion(fetch) 请求体缺 chat_session_id，跳过本轮统计')
+      dbg('🎯 completion(fetch) 请求体缺 chat_session_id，跳过本轮统计')
       return response
     }
-    console.log(TAG, '🎯 拦截到 completion（fetch）', { sessionId, url })
+    dbg('🎯 拦截到 completion（fetch）', { sessionId, url })
     currentSessionId = sessionId
     getSession(sessionId).hasCompletion = true
 
@@ -907,7 +1071,7 @@ window.fetch = async function (input, init) {
     const parser = createSseParser(sessionId)
     parseStream(response.clone().body, parser)
   } catch (err) {
-    console.warn(TAG, 'fetch 拦截异常，已放行原响应', err)
+    dbg('fetch 拦截异常，已放行原响应', err)
   }
 
   return response
@@ -944,21 +1108,26 @@ function rememberAuthHeader(headers) {
 
 // 历史请求可能是 fetch：读取 clone 响应体，与 XHR 路径共用同一套回补逻辑
 function captureHistoryResponse(url, response, headers) {
-  try {
-    const sessionId = getSessionIdFromUrl(url)
+  const sessionId = getSessionIdFromUrl(url)
+  const passiveState = passiveHistoryStart(sessionId)
 
+  try {
     response
       .clone()
       .text()
       .then((text) => {
         if (!text) return
         lastHistoryRequest = { url: absoluteUrl(url), headers }
-        console.log(TAG, '🗂 捕获到 history_messages 响应（fetch）', { sessionId })
-        applyHistory(sessionId, text, 'page')
+        dbg('🗂 捕获到 history_messages 响应（fetch）', { sessionId })
+        const ok = applyHistory(sessionId, text, 'page')
+        // 被动响应成功应用：通知正在进行的主动全量请求让路
+        if (ok) notifyPassiveResolved(sessionId)
       })
-      .catch((err) => console.warn(TAG, '🗂 fetch 历史响应读取失败', err))
+      .catch((err) => dbg('🗂 fetch 历史响应读取失败', err))
+      .finally(() => passiveHistoryEnd(passiveState))
   } catch (err) {
-    console.warn(TAG, '🗂 fetch 历史响应捕获失败', err)
+    passiveHistoryEnd(passiveState)
+    dbg('🗂 fetch 历史响应捕获失败', err)
   }
 }
 
@@ -993,7 +1162,7 @@ async function parseStream(stream, parser) {
       parser.push(decoder.decode(value, { stream: true }))
     }
   } catch (err) {
-    console.warn(TAG, 'SSE 解析中断（用户停止或网络抖动），仍尝试收尾', err)
+    dbg('SSE 解析中断（用户停止或网络抖动），仍尝试收尾', err)
     // 中断不参与契约告警计数，避免把自动重连抖动误判为站点改版
     if (typeof parser.abort === 'function') parser.abort()
   } finally {
@@ -1003,7 +1172,7 @@ async function parseStream(stream, parser) {
       if (tail) parser.push(tail)
       parser.flush()
     } catch (err) {
-      console.warn(TAG, 'flush 失败', err)
+      dbg('flush 失败', err)
     }
   }
 }
@@ -1036,7 +1205,7 @@ XMLHttpRequest.prototype.send = function (body) {
   try {
     const url = this.__deepbrimUrl || ''
     if (DEBUG && (url.includes(COMPLETION_PATH) || url.includes(HISTORY_PATH))) {
-      console.log(TAG, '🔍 xhr:', url)
+      dbg('🔍 xhr:', url)
     }
 
     if (url.includes(COMPLETION_PATH)) {
@@ -1045,7 +1214,7 @@ XMLHttpRequest.prototype.send = function (body) {
       attachHistoryCapture(this, url)
     }
   } catch (err) {
-    console.warn(TAG, 'XHR 拦截异常，已放行原请求', err)
+    dbg('XHR 拦截异常，已放行原请求', err)
   }
 
   return origSend.apply(this, arguments)
@@ -1056,13 +1225,13 @@ function attachCompletionParser(xhr, url, body) {
 
   // 宁可这轮不统计，也不能把数据记到错误会话上
   if (!sessionId) {
-    console.warn(TAG, '🎯 completion 请求体缺 chat_session_id，跳过本轮统计')
+    dbg('🎯 completion 请求体缺 chat_session_id，跳过本轮统计')
     return
   }
 
   currentSessionId = sessionId
   getSession(sessionId).hasCompletion = true
-  console.log(TAG, '🎯 拦截到 completion（xhr）', { sessionId, url })
+  dbg('🎯 拦截到 completion（xhr）', { sessionId, url })
 
   const parser = createSseParser(sessionId)
   let consumed = 0
@@ -1077,7 +1246,7 @@ function attachCompletionParser(xhr, url, body) {
         consumed = text.length
       }
     } catch (err) {
-      console.warn(TAG, '读取 XHR responseText 失败', err)
+      dbg('读取 XHR responseText 失败', err)
     }
   })
 
@@ -1095,7 +1264,7 @@ function attachCompletionParser(xhr, url, body) {
         }
       }
     } catch (err) {
-      console.warn(TAG, 'loadend 读取失败', err)
+      dbg('loadend 读取失败', err)
     }
     parser.flush()
   })
@@ -1103,6 +1272,7 @@ function attachCompletionParser(xhr, url, body) {
 
 function attachHistoryCapture(xhr, url) {
   const sessionId = getSessionIdFromUrl(url)
+  const passiveState = passiveHistoryStart(sessionId)
 
   xhr.addEventListener('loadend', () => {
     try {
@@ -1115,10 +1285,14 @@ function attachHistoryCapture(xhr, url) {
       if (!text) return
 
       lastHistoryRequest = { url, headers: xhr.__deepbrimHeaders || {} }
-      console.log(TAG, '🗂 捕获到 history_messages 响应', { sessionId })
-      applyHistory(sessionId, text, 'page')
+      dbg('🗂 捕获到 history_messages 响应', { sessionId })
+      const ok = applyHistory(sessionId, text, 'page')
+      // 被动响应成功应用：通知正在进行的主动全量请求让路
+      if (ok) notifyPassiveResolved(sessionId)
     } catch (err) {
-      console.warn(TAG, '历史响应解析失败', err)
+      dbg('历史响应解析失败', err)
+    } finally {
+      passiveHistoryEnd(passiveState)
     }
   })
 }
@@ -1220,8 +1394,9 @@ function postToContent(type, payload) {
   window.postMessage({ source: 'deepbrim', type, payload }, location.origin)
 }
 
-// 控制台调试入口：只在 DEBUG 下挂载，且不暴露原始会话映射
-if (DEBUG) {
+// 控制台调试入口：只暴露脱敏视图，随调试开关动态挂载/卸载
+function installDebugApi() {
+  if (window.__deepbrim) return
   window.__deepbrim = {
     refreshHistory,
     probeLimit,
@@ -1237,11 +1412,39 @@ if (DEBUG) {
   }
 }
 
-// 浮层（isolated world）请求重拉 / 主动拉取历史
+function uninstallDebugApi() {
+  try {
+    delete window.__deepbrim
+  } catch {
+    // 忽略
+  }
+}
+
+if (DEBUG) installDebugApi()
+
+// 浮层（isolated world）请求重拉 / 主动拉取历史 / 切换调试日志
 window.addEventListener('message', (event) => {
   if (event.source !== window) return
   const data = event.data
-  if (!data || data.source !== 'deepbrim-ui') return
+  if (!data) return
+
+  // 只接受浮层（isolated world）发来的指令
+  if (data.source !== 'deepbrim-ui') return
+
+  if (data.type === 'toggle-debug') {
+    const enabled = !!data.enabled
+    const changed = enabled !== DEBUG
+    DEBUG = enabled
+
+    if (enabled) {
+      installDebugApi()
+      // 初始化阶段可能收到多次相同状态，只在真正切换时提示一次
+      if (changed) dbg('🛠️ 开发者调试模式已开启，将输出详细底层日志')
+    } else {
+      uninstallDebugApi()
+    }
+    return
+  }
 
   if (data.type === 'refresh') {
     refreshHistory(data.sessionId || currentSessionId)
@@ -1252,4 +1455,7 @@ window.addEventListener('message', (event) => {
   }
 })
 
-console.log(TAG, 'inject.js 已注入 MAIN world（fetch + xhr + 历史回补）')
+// 页面加载时向浮层询问当前调试状态，避免与设置页的初始化消息错过
+window.postMessage({ source: 'deepbrim', type: 'debug-state-request' }, location.origin)
+
+dbg('inject.js 已注入 MAIN world（fetch + xhr + 历史回补）')

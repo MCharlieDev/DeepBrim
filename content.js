@@ -11,6 +11,7 @@ const POS_KEY = 'deepbrim.pos'
 const LIMIT_KEY = 'deepbrim.limit'
 const THEME_KEY = 'deepbrim.theme'
 const AUTO_CLEAR_KEY = 'deepbrim.autoClear'
+const DEBUG_KEY = 'deepbrim.debugMode'
 const CACHE_PREFIX = 'deepbrim.cache.'
 const CACHE_INDEX_KEY = 'deepbrim.cacheIndex'
 const MAX_CACHE_ENTRIES = 200
@@ -48,6 +49,8 @@ let settingsTab = 'basic'
 let themeChoice = 'auto'
 // 自动清除缓存：保留最近 N 天更新过的会话缓存，0 表示关闭；默认 30 天
 let autoClearDays = 30
+// 底层调试日志开关，默认关闭
+let debugMode = false
 let themeObserver = null
 let bodyThemeObserved = false
 let dragging = false
@@ -62,6 +65,23 @@ let contractWarned = false
 // 未手动拖拽过、位置仍由输入框锚定
 let anchorMode = false
 let anchorRetryTimer = null
+
+// 浮层日志统一出口：仅在调试开关打开时输出
+function cdbg(...args) {
+  if (debugMode) console.log(TAG, ...args)
+}
+
+function postDebugMode() {
+  window.postMessage(
+    { source: 'deepbrim-ui', type: 'toggle-debug', enabled: debugMode },
+    location.origin
+  )
+}
+
+function syncDebugToggle() {
+  const toggle = shadow.querySelector('#db-debug-toggle')
+  if (toggle) toggle.checked = debugMode
+}
 
 init()
 
@@ -401,6 +421,22 @@ function template() {
         color: #4b5563;
         margin-bottom: 6px;
       }
+      .db-field .db-check {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 0;
+        font-size: 12px;
+        color: #374151;
+        cursor: pointer;
+      }
+      .db-field .db-check input {
+        width: auto;
+        height: auto;
+        margin: 0;
+        accent-color: #2563eb;
+        cursor: pointer;
+      }
       .db-field select, .db-field input {
         width: 100%;
         height: 26px;
@@ -603,6 +639,7 @@ function template() {
         border-color: rgba(255, 255, 255, .15);
       }
       :host([data-db-theme="dark"]) .db-field label { color: #9ca3af; }
+      :host([data-db-theme="dark"]) .db-field .db-check { color: #d1d5db; }
       :host([data-db-theme="dark"]) .db-theme-btn {
         background: #242932;
         color: #e5e7eb;
@@ -722,6 +759,12 @@ function template() {
                 <option value="7">超过 7 天未更新时清除</option>
                 <option value="0">关闭</option>
               </select>
+            </div>
+            <div class="db-field">
+              <label class="db-check" for="db-debug-toggle">
+                <input type="checkbox" id="db-debug-toggle">
+                <span>开启底层调试日志 (DEBUG)</span>
+              </label>
             </div>
           </section>
 
@@ -892,6 +935,28 @@ function bindEvents() {
   const autoClearSelect = shadow.querySelector('.db-autoclear-select')
   autoClearSelect.addEventListener('change', () => saveAutoClear(Number(autoClearSelect.value)))
 
+  const debugToggle = shadow.querySelector('#db-debug-toggle')
+  debugToggle.addEventListener('change', () => {
+    debugMode = debugToggle.checked
+    try {
+      chrome.storage.local.set({ [DEBUG_KEY]: debugMode })
+    } catch {
+      // 无扩展上下文时忽略
+    }
+    postDebugMode()
+  })
+
+  try {
+    chrome.storage.local.get(DEBUG_KEY, (res) => {
+      debugMode = !!(res && res[DEBUG_KEY])
+      syncDebugToggle()
+      postDebugMode()
+    })
+  } catch {
+    syncDebugToggle()
+    postDebugMode()
+  }
+
   settingsBackdrop.addEventListener('click', closeSettings)
 
   document.addEventListener('keydown', (e) => {
@@ -919,6 +984,13 @@ function bindEvents() {
   window.addEventListener('message', (event) => {
     if (event.source !== window) return
     if (!event.data || event.data.source !== 'deepbrim') return
+
+    // inject 可能先于 storage 读取完成加载：收到询问就把当前调试状态回发
+    if (event.data.type === 'debug-state-request') {
+      postDebugMode()
+      return
+    }
+
     handleData(event.data)
   })
 
@@ -960,6 +1032,15 @@ function bindEvents() {
       if (changes[AUTO_CLEAR_KEY]) {
         autoClearDays = normalizeAutoClear(changes[AUTO_CLEAR_KEY].newValue)
         syncAutoClearSelect()
+      }
+
+      if (changes[DEBUG_KEY]) {
+        const next = !!changes[DEBUG_KEY].newValue
+        if (next !== debugMode) {
+          debugMode = next
+          syncDebugToggle()
+          postDebugMode()
+        }
       }
     })
   } catch {
@@ -1162,7 +1243,7 @@ function handleData(msg) {
     if (payload.title) state.title = payload.title
     if (payload.baselineSource === 'message-field' && baseline != null) {
       if (state.officialTotal != null && state.officialTotal !== baseline) {
-        console.log(TAG, `🗂 历史校准总量 ${state.officialTotal} → ${baseline}`)
+        cdbg(`🗂 历史校准总量 ${state.officialTotal} → ${baseline}`)
       }
       state.officialTotal = baseline
     }
@@ -1204,7 +1285,7 @@ function handleData(msg) {
   if (type === 'contract-warning') {
     if (!contractWarned) {
       contractWarned = true
-      console.warn(TAG, '⚠️ 连续多轮解析不到 Token 字段，站点接口可能已改版')
+      cdbg('⚠️ 连续多轮解析不到 Token 字段，站点接口可能已改版')
       showToast('站点可能改版，Token 统计已失效', { timeout: 4000 })
     }
     return
@@ -1365,7 +1446,7 @@ function updateCacheIndex(id, updatedAt) {
       chrome.storage.local.set({ [CACHE_INDEX_KEY]: Object.fromEntries(keep) })
       if (drop.length) {
         chrome.storage.local.remove(drop.map(([sid]) => CACHE_PREFIX + sid))
-        console.log(TAG, `🗂 缓存 LRU 清理 ${drop.length} 条`)
+        cdbg(`🗂 缓存 LRU 清理 ${drop.length} 条`)
       }
     })
   } catch {
@@ -1470,7 +1551,7 @@ function removeStaleCaches(staleIds, days, keepIndex) {
         if (settingsModal.classList.contains('db-open')) loadCacheList()
       })
     })
-    console.log(TAG, `🧹 自动清除 ${staleIds.length} 条超过 ${days} 天未更新的会话缓存`)
+    cdbg(`🧹 自动清除 ${staleIds.length} 条超过 ${days} 天未更新的会话缓存`)
   })
 }
 
@@ -1732,7 +1813,7 @@ function applyTheme() {
   if (host.getAttribute('data-db-theme') === next) return
 
   host.setAttribute('data-db-theme', next)
-  console.log(TAG, `🎨 主题切换为 ${next}${themeChoice === 'auto' ? '（跟随网页）' : '（手动）'}`)
+  cdbg(`🎨 主题切换为 ${next}${themeChoice === 'auto' ? '（跟随网页）' : '（手动）'}`)
 }
 
 function resolveTheme() {
@@ -2186,4 +2267,4 @@ function formatTokens(value) {
   return `${(value / 1000000).toFixed(2)}M`
 }
 
-console.log(TAG, '浮层已挂载（面板内含设置视图）')
+cdbg('浮层已挂载（面板内含设置视图）')
