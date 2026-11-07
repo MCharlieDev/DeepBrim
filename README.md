@@ -33,8 +33,12 @@
 ## 📸 界面预览
 
 <p align="center">
-  <img src="你的截图1地址" width="45%" alt="长文分析预警" />
-  <img src="你的截图2地址" width="45%" alt="官方真值面板" />
+  <img src="https://raw.githubusercontent.com/MCharlieDev/DeepBrim/main/screenshot-1.png" width="48%" alt="极简空态" />
+  <img src="https://raw.githubusercontent.com/MCharlieDev/DeepBrim/main/screenshot-2.png" width="48%" alt="长文预警" />
+</p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MCharlieDev/DeepBrim/main/screenshot-3.png" width="48%" alt="设置面板" />
+  <img src="https://raw.githubusercontent.com/MCharlieDev/DeepBrim/main/screenshot-4.png" width="48%" alt="官方真值" />
 </p>
 
 ## 🚀 安装方式
